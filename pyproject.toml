@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sensei"
+version = "0.1.0"
+description = "Certified Sensitivity Repair for Decision Tree Ensembles"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "formal-trust-AI" }
+
+dependencies = [
+    "xgboost==1.7.1",           # pinned: matches Ensense's benchmark models
+    "gurobipy>=10.0",           # license required, see README section 3
+    "z3-solver>=4.12",
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "scikit-learn>=1.3",
+    "joblib>=1.2",               # already a scikit-learn dependency; loads scaler.pkl directly
+    "pandas>=2.0",
+    "pyyaml>=6.0",
+    "tqdm>=4.65",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "ruff>=0.4",
+    "mypy>=1.8",
+    "pre-commit>=3.5",
+]
+plots = [
+    "matplotlib>=3.7",
+    "seaborn>=0.13",
+]
+all = ["sensei[dev,plots]"]
+
+[project.scripts]
+sensei = "sensei.main:main"
+
+[tool.setuptools.packages.find]
+include = ["sensei*", "experiments*"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_unused_ignores = true
+ignore_missing_imports = true   # gurobipy and z3 ship incomplete stubs
+
+[tool.pyright]
+reportMissingTypeStubs = "information"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: requires a full Gurobi license (deselect with '-m \"not slow\"')",
+]

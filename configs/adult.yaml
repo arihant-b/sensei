@@ -1,0 +1,29 @@
+# configs/adult.yaml
+dataset: adult
+
+# ranges/functional_deps below are in the SAME min-max-scaled space as
+# dataset/adult/train.csv (see dataset/adult/scaler.pkl), NOT raw units
+# -- ValidityChecker trusts the units declared here exactly, it does not
+# convert them. age's and hours-per-week's declared range each happen to
+# span the scaler's full fit range, so they scale to (0.0, 1.0);
+# 'education == Doctorate' scales to 0.6666666666666666 (ordinal index
+# 10 of 16 categories, see encoding_map.json); 'education-num == 16'
+# scales to 1.0. See spec.py / CLAUDE.md for how this was verified.
+spec:
+  protected: [sex, race]          # dataset column is 'sex', not 'gender'
+  monotone:
+    education-num: up
+    hours-per-week: up
+  immutable: [native-country]
+  integer_features: [
+    age,
+    education-num,
+    hours-per-week,
+    capital-gain,
+    capital-loss]
+  one_hot_groups: {}
+  ranges:
+    age: [0.0, 1.0]
+    hours-per-week: [0.0, 1.0]
+  functional_deps:
+    - [education, 0.6666666666666666, education-num, 1.0]
