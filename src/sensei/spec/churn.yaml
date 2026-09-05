@@ -1,0 +1,15 @@
+dataset: churn
+
+protected: [gender, SeniorCitizen]
+monotone:
+  tenure: increasing
+immutable: [customerID]
+
+integer_features: [tenure, SeniorCitizen]
+one_hot_groups: {}
+ranges: {}
+functional_deps: []
+
+preprocessing:
+  drop_fd_redundant_columns: [customerID]
+  integer_code_features: [tenure, SeniorCitizen]

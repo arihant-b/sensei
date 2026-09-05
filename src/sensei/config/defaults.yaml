@@ -1,0 +1,36 @@
+dataset:
+  test_size: 0.2 # fraction of the dataset to hold out for final evaluation of the model's accuracy and plausibility
+  eval_holdout: 0.2 # fraction of training data to hold out for evaluation of the model's accuracy and plausibility
+
+model:
+  n_estimators: 200 # number of trees in the ensemble
+  max_depth: 5 # maximum depth of each tree in the ensemble
+
+sensitivity:
+  eps: 0.10 # sensitivity threshold
+  theta: 1.0e-6 # plausibility threshold
+  gap: 0.50 # confident-flip margin (Ensense's --output_gap convention)
+
+repair:
+  mu: 0.01 # proximal weight on ||v - v0||^2
+  kap: 100.0 # weight on plausibility constraints
+
+loop:
+  max_iters: 50 # maximum number of iterations
+  A_min: 0.82 # minimum accuracy threshold to continue the loop
+  stall_delta: 1.0e-3 # minimum improvement in accuracy to avoid stalling
+  cuts_per_round: 5 # maximum number of cuts to add per iteration
+
+oracle:
+  time_limit_s: 300.0 # time limit for the oracle solver (Gurobi) in seconds
+  mip_gap: 0.05 # relative MIP gap for the oracle solver (Gurobi)
+
+bins:
+  n_quantile_bins: 10 # number of quantile bins to use for discretizing continuous features
+
+results_dir: results/ # directory to store results of experiments
+
+seeds: # extend this list rather than hardcoding a seed anywhere else.
+  data_split: 42 # seed for splitting the dataset into training and test sets
+  model_train: 42 # seed for training the initial model
+  baseline4_retrain: 42 # seed for retraining the baseline4 model

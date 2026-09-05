@@ -1,0 +1,16 @@
+dataset: german_credit
+
+protected: [PersonalStatusSex, Age]
+monotone:
+  CreditAmount: decreasing
+  Duration: decreasing
+immutable: []
+
+integer_features: [Duration, CreditAmount, Age]
+one_hot_groups: {}
+ranges: {}
+functional_deps: []
+
+preprocessing:
+  drop_fd_redundant_columns: []
+  integer_code_features: [Duration, CreditAmount, Age]

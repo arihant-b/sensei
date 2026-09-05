@@ -1,0 +1,20 @@
+dataset: adult
+
+protected: [sex, race]
+monotone:
+  education-num: increasing
+  hours-per-week: increasing
+immutable: [native-country]
+
+integer_features:
+  [age, education-num, hours-per-week, capital-gain, capital-loss]
+one_hot_groups: {}
+ranges:
+  age: [0.0, 1.0]
+  hours-per-week: [0.0, 1.0]
+functional_deps:
+  - [education, 0.6666666666666666, education-num, 1.0]
+
+preprocessing:
+  drop_fd_redundant_columns: [] # candidate: drop 'education', keep 'education-num'
+  integer_code_features: [] # candidate: same list as integer_features above

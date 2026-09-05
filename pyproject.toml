@@ -7,20 +7,31 @@ name = "sensei"
 version = "0.1.0"
 description = "Certified Sensitivity Repair for Decision Tree Ensembles"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = { text = "formal-trust-AI" }
 
 dependencies = [
-    "xgboost==1.7.1",           # pinned: matches Ensense's benchmark models
-    "gurobipy>=10.0",           # license required, see README section 3
-    "z3-solver>=4.12",
-    "numpy>=1.24",
+    # PINNED at 3.1.1, matching the vendored ensense/'s own requirements.txt
+    # -- resolves the Stage 0 report's open item 1. Re-verified against this
+    # version: leaf value still lives in trees_to_dataframe()'s 'Gain'
+    # column, base_score is still stored in the objective's own output space
+    # (still needs the logit transform for binary:logistic -- see
+    # sensei/model/leaves.py's _read_base_score), save_model()/load_model()
+    # JSON round-trips correctly for ensense_adapter.py.
+    "xgboost==3.1.1",
+    "gurobipy>=13.0",
+    "z3-solver>=4.15", # ensense/requirements.txt pins 4.15.3.0
+    # NOTE: ensense/requirements.txt pins numpy<2, but this environment
+    # actually runs numpy 2.5.2 (installed before this dependency was
+    # written down -- the earlier "numpy<2" pin here was aspirational, not
+    # verified). Flagging rather than silently downgrading numpy, which
+    # would risk breaking everything already verified against 2.5.2.
+    "numpy>=2",
     "scipy>=1.10",
-    "scikit-learn>=1.3",
-    "joblib>=1.2",               # already a scikit-learn dependency; loads scaler.pkl directly
+    "scikit-learn>=1.7",
+    "joblib>=1.5",
     "pandas>=2.0",
     "pyyaml>=6.0",
-    "tqdm>=4.65",
 ]
 
 [project.optional-dependencies]
@@ -29,34 +40,41 @@ dev = [
     "pytest-cov>=4.1",
     "ruff>=0.4",
     "mypy>=1.8",
-    "pre-commit>=3.5",
 ]
-plots = [
-    "matplotlib>=3.7",
-    "seaborn>=0.13",
-]
-all = ["sensei[dev,plots]"]
 
 [project.scripts]
-sensei = "sensei.main:main"
+sensei = "sensei.cli:main"
 
+# Standard src-layout: the `sensei` package lives at src/sensei/, not at the
+# project root (that's what pushed run scripts out to top-level experiments/
+# in the first place). Deliberately NOT the package-dir={"sensei": "src"}
+# rename trick this project tried first -- that made `import sensei` work at
+# runtime (Python executes the generated editable-install finder), but static
+# analyzers (Pyright/Pylance, and anything else that resolves imports without
+# executing code) can't follow it, since there is no real "sensei" directory
+# anywhere for them to find. `where = ["src"]` auto-discovery here works
+# correctly because the on-disk directory name (src/sensei/) now matches the
+# package name -- no manual package list needed.
 [tool.setuptools.packages.find]
-include = ["sensei*", "experiments*"]
+where = ["src"]
+
+[tool.setuptools.package-data]
+sensei = ["config/*.yaml", "config/*.txt", "spec/*.yaml"]
 
 [tool.ruff]
 line-length = 88
-target-version = "py310"
+target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.11"
 warn_unused_ignores = true
-ignore_missing_imports = true   # gurobipy and z3 ship incomplete stubs
+ignore_missing_imports = true # gurobipy and z3 ship incomplete stubs
 
 [tool.pyright]
-reportMissingTypeStubs = "information"
+reportMissingTypeStubs = "none"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,0 +1,15 @@
+dataset: pimadiabetes
+
+protected: []
+monotone:
+  Glucose: increasing
+immutable: []
+
+integer_features: [Pregnancies]
+one_hot_groups: {}
+ranges: {}
+functional_deps: []
+
+preprocessing:
+  drop_fd_redundant_columns: []
+  integer_code_features: [Pregnancies]
