@@ -5,7 +5,7 @@ feature,name,lb,ub
 3,education,0.0,1.0
 4,education-num,0.0,1.0
 5,marital-status,0.0,1.0
-6,occupation,0.0,1.0
+6,occupation,0.0,0.9999999999999999
 7,relationship,0.0,1.0
 8,race,0.0,1.0
 9,sex,0.0,1.0

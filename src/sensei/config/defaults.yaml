@@ -8,29 +8,33 @@ model:
 
 sensitivity:
   eps: 0.10 # sensitivity threshold
-  theta: 1.0e-6 # plausibility threshold
-  gap: 0.50 # confident-flip margin (Ensense's --output_gap convention)
+  theta: 1e-9 # plausibility threshold
+  gap: 0.30 # confident-flip margin (Ensense's --output_gap convention). NOT 0.5: that
+            # makes output_gap=(0.5,0.5), a zero-width band where Ensense core's own
+            # milp solver (ensense/src/milp.py) can internally decide "insensitive"
+            # yet still return a degenerate identical-point pair instead of None --
+            # confirmed on adult/sex/30-tree/depth-4; do not set this back to 0.5
 
 repair:
-  mu: 0.01 # proximal weight on ||v - v0||^2
+  mu: 0.1 # proximal weight on ||v - v0||^2
   kap: 100.0 # weight on plausibility constraints
+  type: "approx"
 
 loop:
   max_iters: 50 # maximum number of iterations
   A_min: 0.82 # minimum accuracy threshold to continue the loop
-  stall_delta: 1.0e-3 # minimum improvement in accuracy to avoid stalling
-  cuts_per_round: 5 # maximum number of cuts to add per iteration
+  stall_delta: 1e-3 # minimum improvement in accuracy to avoid stalling
+  cuts_per_round: 5 # NOTE: may be redundant. maximum number of cuts to add per iteration
 
 oracle:
   time_limit_s: 300.0 # time limit for the oracle solver (Gurobi) in seconds
   mip_gap: 0.05 # relative MIP gap for the oracle solver (Gurobi)
+  type: "sensei" # which oracle drives the search: "sensei" (own MILP, inhouse) or "ensense" (vendored Ensense core)
+  method: "milp" # which Ensense core solver family to call: "pb" or "milp" (oracle.type == "ensense" only)
 
 bins:
   n_quantile_bins: 10 # number of quantile bins to use for discretizing continuous features
 
 results_dir: results/ # directory to store results of experiments
 
-seeds: # extend this list rather than hardcoding a seed anywhere else.
-  data_split: 42 # seed for splitting the dataset into training and test sets
-  model_train: 42 # seed for training the initial model
-  baseline4_retrain: 42 # seed for retraining the baseline4 model
+seed: 42 # single global seed

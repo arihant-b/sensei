@@ -1,34 +1,35 @@
-from sensei.data.bins import Point
+from sensei.data.bins import EncodedSample
 from sensei.spec import Spec
+from sensei.validity.pairwise import pair_check, pair_reason
 
 _TOL = 1e-6
+_REL_TOL = 1e-6
 
 
 class TypeRuleChecker:
     """
-    Q1 checks: integrality, one-hot, ranges, immutable features.
+    Q1 checks: one-hot, ranges, immutable features.
+
+    Integrality is intentionally NOT one of the pair-level checks here
+    (`is_type_valid`/`type_valid_reason`, and therefore `Postfilter`, which
+    is Ensense-only -- the sensei oracle enforces integrality directly as a
+    hard MILP constraint in `oracle/sensei/encoding.py`, unrelated to this
+    module): Ensense-sourced counterexamples are taken as already
+    type-valid on this dimension, so this postfilter does not re-derive it.
+    `is_integral` itself stays defined and tested as a standalone utility.
     """
 
     @staticmethod
     def is_integral(
-        x: Point,
+        x: EncodedSample,
         feature: str,
         feature_bounds: dict[str, tuple[float, float]],
         tol: float = _TOL,
     ) -> bool:
         """
-        Check a min-max-scaled [0,1] value corresponds to an integral raw value.
-
-        Args:
-            x (Point): The point to check.
-            feature (str): The feature to check.
-            feature_bounds (dict[str, tuple[float, float]]): The bounds for each
-                                                             feature.
-            tol (float, optional): The tolerance for the check. Defaults to _TOL.
-
-        Returns:
-            bool: True if the scaled value corresponds to an integral raw value, False
-                  otherwise.
+        Unscale `x[feature]` back to raw units (`lo + x * (hi - lo)`) and
+        check it's within `tol` of a whole number. True if `feature` isn't
+        in `feature_bounds`/`x` at all -- nothing to verify.
         """
 
         # no scaler info for this feature -- can't verify
@@ -37,50 +38,12 @@ class TypeRuleChecker:
 
         lo, hi = feature_bounds[feature]
         raw: float = lo + float(x[feature]) * (hi - lo)
-        return abs(raw - round(raw)) <= tol
+        allowed: float = max(tol, _REL_TOL * abs(raw))
+        return abs(raw - round(raw)) <= allowed
 
     @staticmethod
-    def check_integer_features(
-        x: Point, spec: Spec, feature_bounds: dict[str, tuple[float, float]]
-    ) -> bool:
-        """
-        Check that all features declared as integer in the spec are indeed integral
-        in the given point.
-
-        Args:
-            x (Point): The point to check.
-            spec (Spec): The specification containing the integer features.
-            feature_bounds (dict[str, tuple[float, float]]): The bounds for each
-                                                             feature.
-
-        Returns:
-            bool: True if all integer features are integral in the point,
-                  False otherwise.
-        """
-
-        return all(
-            map(
-                TypeRuleChecker.is_integral,
-                [x] * len(spec.integer_features),
-                spec.integer_features,
-                [feature_bounds] * len(spec.integer_features),
-            )
-        )
-
-    @staticmethod
-    def check_one_hot_groups(x: Point, spec: Spec, tol: float = _TOL) -> bool:
-        """
-        Check that all one-hot groups declared in the spec are valid in the given point.
-
-        Args:
-            x (Point): The point to check.
-            spec (Spec): The specification containing the one-hot groups.
-            tol (float, optional): The tolerance for floating-point comparisons.
-                                   Defaults to _TOL.
-
-        Returns:
-            bool: True if all one-hot groups are valid in the point, False otherwise.
-        """
+    def check_one_hot_groups(x: EncodedSample, spec: Spec, tol: float = _TOL) -> bool:
+        """Every `spec.one_hot_groups` group is exactly one 1 and the rest 0 in `x`."""
 
         for columns in spec.one_hot_groups.values():
             values: list[float] = list(
@@ -99,21 +62,8 @@ class TypeRuleChecker:
         return True
 
     @staticmethod
-    def check_ranges(x: Point, spec: Spec, tol: float = 1e-9) -> bool:
-        """
-        Check that all features declared with ranges in the spec are within those
-        ranges in the given point.
-
-        Args:
-            x (Point): The point to check.
-            spec (Spec): The specification containing the feature constraints.
-            tol (float, optional): The tolerance for floating-point comparisons.
-                                   Defaults to 1e-9.
-
-        Returns:
-            bool: True if all features are within their declared ranges, False
-                  otherwise.
-        """
+    def check_ranges(x: EncodedSample, spec: Spec, tol: float = 1e-9) -> bool:
+        """Every `spec.ranges[feature] = (lo, hi)` holds for `x`, within `tol`."""
 
         for feature, (lo, hi) in spec.ranges.items():
             if feature not in x:
@@ -128,23 +78,9 @@ class TypeRuleChecker:
 
     @staticmethod
     def check_immutable_unchanged(
-        x1: Point, x2: Point, spec: Spec, tol: float = 1e-9
+        x1: EncodedSample, x2: EncodedSample, spec: Spec, tol: float = 1e-9
     ) -> bool:
-        """
-        Check that all immutable features declared in the spec have the same value in
-        both points.
-
-        Args:
-            x1 (Point): The first point to check.
-            x2 (Point): The second point to check.
-            spec (Spec): The specification containing the immutable features.
-            tol (float, optional): The tolerance for floating-point comparisons.
-                                   Defaults to 1e-9.
-
-        Returns:
-            bool: True if all immutable features are unchanged between the two points,
-                  False otherwise.
-        """
+        """Every `spec.immutable` feature has the same value in x1 and x2."""
 
         for feature in spec.immutable:
             if (
@@ -157,49 +93,101 @@ class TypeRuleChecker:
         return True
 
     @staticmethod
-    def is_type_valid(
-        x: Point, spec: Spec, feature_bounds: dict[str, tuple[float, float]]
-    ) -> bool:
+    def type_valid_reason(
+        x: EncodedSample, spec: Spec, feature_bounds: dict[str, tuple[float, float]]
+    ) -> str | None:
         """
-        Q1 checks on a single point: integrality, one-hot, ranges.
-
-        Args:
-            x (Point): The point to check.
-            spec (Spec): The specification containing the feature constraints.
-            feature_bounds (dict[str, tuple[float, float]]): The bounds for each
-                                                             feature.
-
-        Returns:
-            bool: True if the point is type-valid, False otherwise.
+        Diagnostic form of `is_type_valid`: the first failing rule's reason
+        (e.g. `"workclass_not_one_hot"`, `"hours-per-week_not_in_range"`), or
+        None if `x` is fully type-valid. Mirrors `is_type_valid`'s checks and
+        their order, but walks each rule individually instead of
+        short-circuiting on an aggregate bool -- kept separate so the common
+        pass-through path (`is_type_valid` itself) stays cheap, and this walk
+        only runs when a caller needs to explain a rejection
+        (`Postfilter.diagnose_pair`).
         """
 
-        return (
-            TypeRuleChecker.check_integer_features(x, spec, feature_bounds)
-            and TypeRuleChecker.check_one_hot_groups(x, spec)
-            and TypeRuleChecker.check_ranges(x, spec)
+        for group, columns in spec.one_hot_groups.items():
+            values: list[float] = [float(x[c]) for c in columns if c in x]
+
+            if len(values) != len(columns):
+                continue
+
+            if not all(abs(v) < _TOL or abs(v - 1.0) < _TOL for v in values):
+                return f"{group}_not_one_hot"
+
+            if abs(sum(values) - 1.0) > _TOL:
+                return f"{group}_not_one_hot"
+
+        for feature, (lo, hi) in spec.ranges.items():
+            if feature not in x:
+                continue
+
+            value = float(x[feature])
+
+            if value < lo - 1e-9 or value > hi + 1e-9:
+                return f"{feature}_not_in_range"
+
+        return None
+
+    @staticmethod
+    def immutable_reason(
+        x1: EncodedSample, x2: EncodedSample, spec: Spec, tol: float = 1e-9
+    ) -> str | None:
+        """
+        Diagnostic form of `check_immutable_unchanged`: the first immutable
+        feature that changed between `x1` and `x2`, or None if none did.
+        """
+
+        for feature in spec.immutable:
+            if (
+                feature in x1
+                and feature in x2
+                and abs(float(x1[feature]) - float(x2[feature])) > tol
+            ):
+                return f"{feature}_not_immutable"
+
+        return None
+
+    @staticmethod
+    def type_valid_pair_reason(
+        x1: EncodedSample,
+        x2: EncodedSample,
+        spec: Spec,
+        feature_bounds: dict[str, tuple[float, float]],
+    ) -> str | None:
+        """
+        Diagnostic form of `is_type_valid_pair`: the first failing reason,
+        prefixed with which point it came from (`"x1."`/`"x2."`), or None if
+        the pair is fully type-valid.
+        """
+
+        reason: str | None = pair_reason(
+            TypeRuleChecker.type_valid_reason, x1, x2, spec, feature_bounds
         )
+        if reason is not None:
+            return reason
+        return TypeRuleChecker.immutable_reason(x1, x2, spec)
+
+    @staticmethod
+    def is_type_valid(
+        x: EncodedSample, spec: Spec, feature_bounds: dict[str, tuple[float, float]]
+    ) -> bool:
+        """Q1 checks on a single point: one-hot, ranges."""
+
+        return TypeRuleChecker.check_one_hot_groups(
+            x, spec
+        ) and TypeRuleChecker.check_ranges(x, spec)
 
     @staticmethod
     def is_type_valid_pair(
-        x1: Point, x2: Point, spec: Spec, feature_bounds: dict[str, tuple[float, float]]
+        x1: EncodedSample,
+        x2: EncodedSample,
+        spec: Spec,
+        feature_bounds: dict[str, tuple[float, float]],
     ) -> bool:
-        """
-        Q1 checks on a pair: both points type-valid, plus immutability holds.
+        """Q1 checks on a pair: both points type-valid, plus immutability holds."""
 
-        Args:
-            x1 (Point): The first point to check.
-            x2 (Point): The second point to check.
-            spec (Spec): The specification containing the feature constraints.
-            feature_bounds (dict[str, tuple[float, float]]): The bounds for each
-                                                             feature.
-
-        Returns:
-            bool: True if both points are type-valid and all immutable features are
-                  unchanged, False otherwise.
-        """
-
-        return (
-            TypeRuleChecker.is_type_valid(x1, spec, feature_bounds)
-            and TypeRuleChecker.is_type_valid(x2, spec, feature_bounds)
-            and TypeRuleChecker.check_immutable_unchanged(x1, x2, spec)
-        )
+        return pair_check(
+            TypeRuleChecker.is_type_valid, x1, x2, spec, feature_bounds
+        ) and TypeRuleChecker.check_immutable_unchanged(x1, x2, spec)

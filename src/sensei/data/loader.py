@@ -1,3 +1,4 @@
+import json
 import logging
 from pathlib import Path
 
@@ -17,14 +18,15 @@ class EvalAccessError(RuntimeError):
 
 class Dataset:
     """
-    D_train (80% of train.csv) trains the model and builds all validity/bins machinery.
-    D_eval (the held-out 20%) is untouched until final reporting.
+    Splits train.csv into D_train (trains the model, builds validity/bins
+    machinery) and D_eval (the `eval_holdout` fraction held out, untouched
+    until final reporting). test.csv loads separately as X_test/y_test.
     """
 
     def __init__(self, name: str, eval_holdout: float, seed: int) -> None:
-        self.name = name
-        self.eval_holdout = eval_holdout
-        self.seed = seed
+        self.name: str = name
+        self.eval_holdout: float = eval_holdout
+        self.seed: int = seed
 
         self.X_train: pd.DataFrame | None = None
         self.y_train: pd.Series | None = None
@@ -32,6 +34,7 @@ class Dataset:
         self.y_test: pd.Series | None = None
         self.columns: list[str] | None = None
         self.feature_bounds: dict[str, tuple[float, float]] | None = None
+        self.categorical_levels: dict[str, int] | None = None
 
         self._X_eval: pd.DataFrame | None = None
         self._y_eval: pd.Series | None = None
@@ -39,10 +42,12 @@ class Dataset:
 
     def load(self) -> "Dataset":
         """
-        Load the dataset from disk, splitting train.csv into D_train and D_eval.
+        Read train.csv/test.csv off disk and split train.csv further into
+        D_train and the held-out D_eval.
 
         Returns:
-            Dataset: The Dataset instance with loaded data.
+            Dataset: `self`, loaded -- chains with the constructor:
+                `Dataset(name, holdout, seed).load()`.
         """
 
         root: Path = _DATASET_ROOT / self.name
@@ -67,16 +72,21 @@ class Dataset:
         self._y_eval = y_eval.reset_index(drop=True)
         self.y_test = y_test
         self.feature_bounds = self._load_feature_bounds(root)
+        self.categorical_levels = self._load_categorical_levels(
+            root, self.feature_bounds
+        )
         return self
 
     @property
     def X_eval(self) -> pd.DataFrame:
         """
-        Access the evaluation features. Raises EvalAccessError if accessed more than
-        once.
+        D_eval's features.
 
         Returns:
-            pd.DataFrame: The evaluation features.
+            pd.DataFrame: D_eval's features.
+
+        Raises:
+            EvalAccessError: This is more than the one allowed D_eval access.
         """
 
         eval: pd.DataFrame | pd.Series = self._eval_access("X_eval", self._X_eval)
@@ -86,11 +96,13 @@ class Dataset:
     @property
     def y_eval(self) -> pd.Series:
         """
-        Access the evaluation labels. Raises EvalAccessError if accessed more than
-        once.
+        D_eval's labels.
 
         Returns:
-            pd.Series: The evaluation labels.
+            pd.Series: D_eval's labels.
+
+        Raises:
+            EvalAccessError: This is more than the one allowed D_eval access.
         """
 
         eval: pd.DataFrame | pd.Series = self._eval_access("y_eval", self._y_eval)
@@ -101,19 +113,19 @@ class Dataset:
         self, field_name: str, value: pd.DataFrame | pd.Series | None
     ) -> pd.DataFrame | pd.Series:
         """
-        Access the evaluation data. Raises EvalAccessError if accessed more than once.
+        Log and count one D_eval read, raising EvalAccessError past the
+        first (X_eval + y_eval together count as one access, since a real
+        run needs both).
 
         Args:
-            field_name (str): The name of the field being accessed (X_eval or y_eval).
-            value (pd.DataFrame | pd.Series | None): The value of the field being
-                                                     accessed. If None, raises an
-                                                     assertion error.
-
-        Raises:
-            EvalAccessError: If the evaluation data has been accessed more than once.
+            field_name (str): Which field is being accessed, for logging.
+            value (pd.DataFrame | pd.Series | None): The cached D_eval value.
 
         Returns:
-            pd.DataFrame | pd.Series: The value of the field being accessed.
+            pd.DataFrame | pd.Series: `value`, unchanged.
+
+        Raises:
+            EvalAccessError: This is more than the one allowed D_eval access.
         """
 
         assert value is not None, "call load() before accessing D_eval"
@@ -137,14 +149,14 @@ class Dataset:
 
     def _load_feature_bounds(self, root: Path) -> dict[str, tuple[float, float]]:
         """
-        Load the feature bounds from a saved scaler.
+        (min, max) raw-value bounds per feature, read off the fitted scaler.pkl.
 
         Args:
-            root (Path): The root path of the dataset.
+            root (Path): The dataset's directory, containing `scaler.pkl`.
 
         Returns:
-            dict[str, tuple[float, float]]: A dictionary mapping feature names to their
-                                            (min, max) bounds.
+            dict[str, tuple[float, float]]: Raw `(lo, hi)` bounds per
+                feature, or `{}` if no scaler was found.
         """
 
         scaler_path: Path = root / "scaler.pkl"
@@ -163,23 +175,65 @@ class Dataset:
             )
         }
 
+    def _load_categorical_levels(
+        self, root: Path, feature_bounds: dict[str, tuple[float, float]]
+    ) -> dict[str, int]:
+        """
+        Number of distinct raw values per categorical feature: its
+        encoding_map.json category count, plus one if the column also has a
+        missing-value sentinel. Ensense core's own encoding (data/builder.py
+        matches it) writes a missing categorical value as raw code -1
+        instead of dropping the row, so e.g. `workclass` really has
+        `len(encoding_map["workclass"])` real categories PLUS that sentinel.
+        `feature_bounds[feature][0] < 0` detects the sentinel (a real
+        ordinal code is never negative). This count feeds
+        `FrozenBins._categorical_edges`, which lays bin edges evenly across
+        the column's scaled range -- undercounting by one misaligns every
+        bin for that column.
+
+        Args:
+            root (Path): The dataset's directory, containing `encoding_map.json`.
+            feature_bounds (dict[str, tuple[float, float]]): Raw `(lo, hi)`
+                bounds per feature, to detect the missing-value sentinel.
+
+        Returns:
+            dict[str, int]: Distinct raw value count per categorical
+                feature, or `{}` if no encoding map was found.
+        """
+
+        encoding_map_path: Path = root / "encoding_map.json"
+
+        if not encoding_map_path.exists():
+            return {}
+
+        raw_map: dict[str, list[str]] = json.loads(encoding_map_path.read_text())
+        levels: dict[str, int] = {}
+
+        for feature, categories in raw_map.items():
+            if self.columns is None or feature not in self.columns:
+                continue
+
+            has_missing_sentinel: bool = feature_bounds.get(feature, (0.0, 0.0))[0] < 0
+            levels[feature] = len(categories) + (1 if has_missing_sentinel else 0)
+
+        return levels
+
     def _split_features_label(
         self, df: pd.DataFrame, columns: list[str] | None = None
     ) -> tuple[pd.DataFrame, pd.Series, list[str]]:
         """
-        Split the features and label from a DataFrame.
+        Split (features, label, feature names) out of `df`. The label is
+        always `df`'s last column; `columns` lets a caller reuse train's own
+        feature list for test, instead of re-deriving "everything but the
+        last column" from test's (possibly differently-ordered) columns.
 
         Args:
             df (pd.DataFrame): The DataFrame to split.
-            columns (list[str] | None, optional): The columns to include in the
-                                                  features. If None, all columns except
-                                                  the last one are included. Defaults to
-                                                  None.
+            columns (list[str] | None): Feature names to use; derived from
+                `df` (everything but the last column) if None.
 
         Returns:
-            tuple[pd.DataFrame, pd.Series, list[str]]: A tuple containing the features
-                                                       DataFrame, the label Series, and
-                                                       the list of feature names.
+            tuple[pd.DataFrame, pd.Series, list[str]]: `(X, y, columns)`.
         """
 
         label_col: str = df.columns[-1]

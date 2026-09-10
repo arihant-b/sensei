@@ -1,3 +1,4 @@
+import dataclasses
 import sys
 import tempfile
 from pathlib import Path
@@ -9,10 +10,11 @@ from sensei.oracle.types import Pair
 _ROOT: Path = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT))
 
+from sensei.config import load_defaults  # noqa: E402
 from sensei.data.loader import Dataset  # noqa: E402
 from sensei.model.leaves import LeafMap  # noqa: E402
 from sensei.model.train import Trainer  # noqa: E402
-from sensei.oracle.milp.solve import TierAOracle  # noqa: E402
+from sensei.oracle.sensei.solve import SenseiOracle  # noqa: E402
 
 _ENSENSE_SRC: Path = _ROOT / "ensense" / "src"
 
@@ -71,7 +73,14 @@ def _our_oracle_sensitive(
     timeout: int = 60,
 ) -> bool:
     leaf_map = LeafMap(booster)
-    pair: Pair | None = TierAOracle().worst_valid_pair(
+    defaults = load_defaults()
+    settings = dataclasses.replace(
+        defaults,
+        sensitivity=dataclasses.replace(defaults.sensitivity, eps=eps),
+        oracle=dataclasses.replace(defaults.oracle, time_limit_s=timeout, mip_gap=0.05),
+        seed=42,
+    )
+    pair: Pair | None = SenseiOracle().worst_valid_pair(
         booster,
         leaf_map,
         columns,
@@ -80,10 +89,7 @@ def _our_oracle_sensitive(
         flip_set=flip_set,
         direction="protected",
         mode="feasibility",
-        eps=eps,
-        seed=42,
-        time_limit_s=timeout,
-        mip_gap=0.05,
+        settings=settings,
         enforce_validity=False,
     )
     return pair is not None

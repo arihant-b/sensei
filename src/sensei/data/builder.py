@@ -1,5 +1,7 @@
 import argparse
 import json
+import logging
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -11,15 +13,33 @@ from sklearn.preprocessing import MinMaxScaler
 
 _DATASET_ROOT: Path = Path(__file__).resolve().parents[3] / "dataset"
 
+log: logging.Logger = logging.getLogger("sensei.data.builder")
+
 
 class DatasetBuilder:
     """
-    Build a dataset/<name>/ directory from a raw CSV, with train/test split,
-    categorical encoding, and feature scaling. The output is cached to disk for
-    later use by loader.py and the Ensense core. Artifacts expected on disk:
-        encoding_map.json    raw categorical value -> ordinal index (sorted)
-        scaler.pkl           sklearn MinMaxScaler, fit on the FULL encoded feature
-                             matrix
+    Build a dataset/<name>/ directory from a raw CSV, with categorical encoding,
+    feature scaling, and a train/test split. The output is cached to disk for
+    later use by loader.py and the Ensense core. Encoding/decoding conventions
+    here are matched to Ensense core's own reference implementation
+    (ensense/src/read_output.py::compute_scaling_func/decode_point) on purpose,
+    NOT independently chosen -- a model trained on our encoding must mean the
+    same thing to Ensense core's oracle as it does to us. Artifacts expected on
+    disk:
+        encoding_map.json    raw categorical value -> ordinal index (sorted,
+                             missing/unmapped values excluded from the list --
+                             see _encode_categoricals)
+        scaler.pkl           sklearn MinMaxScaler, fit on the FULL encoded
+                             feature matrix (train+test together, before the
+                             split) -- deliberately, to match Ensense core's own
+                             scaler exactly, confirmed empirically: Ensense's
+                             adult scaler reports fnlwgt's global minimum as
+                             data_min_, but that row only exists in ITS test
+                             split, which is only possible if the scaler saw
+                             both splits at fit time. Fitting on train alone
+                             would silently make our scaler disagree with any
+                             Ensense-side computation that assumes the shared
+                             convention.
         full.csv             whole dataset, scaled, index column kept
         train.csv / test.csv stratified split of full.csv, no index column
         feature_map.json     column name -> f<i> (position in train.csv)
@@ -36,18 +56,17 @@ class DatasetBuilder:
         seed: int = 42,
     ) -> None:
         """
-        Build a dataset from a raw CSV file.
+        Build `dataset/<name>/` from `raw_csv`: encode, scale, split, and
+        write every artifact listed in this class's own docstring.
 
         Args:
-            raw_csv (Path): Path to the raw CSV file.
-            name (str): Name of the dataset.
-            label_col (str | None, optional): Name of the label column. Defaults to
-                                              None.
-            categorical_cols (list[str] | None, optional): List of categorical column
-                                                           names. Defaults to None.
-            test_size (float, optional): Proportion of the dataset to include in the
-                                         test split. Defaults to 0.2.
-            seed (int, optional): Random seed for reproducibility. Defaults to 42.
+            raw_csv (Path): Path to the raw CSV.
+            name (str): `dataset/<name>/` to write into.
+            label_col (str | None): Label column; the last column if None.
+            categorical_cols (list[str] | None): Categorical columns;
+                every string-dtype feature column if None.
+            test_size (float): Fraction held out for `test.csv`.
+            seed (int): Split seed.
         """
 
         df: pd.DataFrame = pd.read_csv(raw_csv)
@@ -55,7 +74,6 @@ class DatasetBuilder:
         label_col, feature_cols, categorical_cols = DatasetBuilder._resolve_columns(
             df, label_col, categorical_cols
         )
-        DatasetBuilder._drop_missing_categoricals(df, categorical_cols)
 
         encoded, encoding_map = DatasetBuilder._encode_categoricals(
             df, categorical_cols
@@ -74,7 +92,7 @@ class DatasetBuilder:
         DatasetBuilder._write_feature_map(out_dir, feature_cols, label_col)
         DatasetBuilder._write_details(out_dir, feature_cols, train_df)
 
-        print(
+        log.info(
             f"wrote dataset/{name}/ "
             f"({len(feature_cols)} features, {len(categorical_cols)} categorical, "
             f"{len(train_df)} train / {len(test_df)} test rows)"
@@ -85,16 +103,19 @@ class DatasetBuilder:
         df: pd.DataFrame, label_col: str | None, categorical_cols: list[str] | None
     ) -> tuple[str, list[str], list[str]]:
         """
-        Resolve the label column, feature columns, and categorical columns.
+        Fill in whatever `build_dataset` callers left as None: the label
+        defaults to `df`'s last column, categorical columns default to
+        every string-dtype feature column.
 
         Args:
-            df (pd.DataFrame): The input DataFrame.
-            label_col (str | None): Name of the label column.
-            categorical_cols (list[str] | None): List of categorical column names.
+            df (pd.DataFrame): The raw DataFrame.
+            label_col (str | None): Label column; the last column if None.
+            categorical_cols (list[str] | None): Categorical columns;
+                every string-dtype feature column if None.
 
         Returns:
-            tuple[str, list[str], list[str]]: The resolved label column, feature
-                                              columns, and categorical columns.
+            tuple[str, list[str], list[str]]: `(label_col, feature_cols,
+                categorical_cols)`, fully resolved.
         """
 
         if label_col is None:
@@ -112,48 +133,39 @@ class DatasetBuilder:
         return label_col, feature_cols, categorical_cols
 
     @staticmethod
-    def _drop_missing_categoricals(
-        df: pd.DataFrame, categorical_cols: list[str]
-    ) -> None:
-        """
-        Drop rows with missing values in categorical columns.
-
-        Args:
-            df (pd.DataFrame): The input DataFrame.
-            categorical_cols (list[str]): List of categorical column names.
-        """
-
-        for col in categorical_cols:
-            n_missing = int(df[col].isna().sum())
-
-            if n_missing > 0:
-                print(f"'{col}': {n_missing} missing values -> dropped")
-                df[col] = df[col].dropna()
-
-    @staticmethod
     def _encode_categoricals(
         df: pd.DataFrame, categorical_cols: list[str]
     ) -> tuple[pd.DataFrame, dict[str, list[str]]]:
         """
         Encode categorical columns as ordinal indices, and return the encoding map.
+        Matches Ensense core's own encoding exactly
+        (ensense/src/read_output.py::compute_scaling_func): the category list is
+        the column's distinct non-missing values, sorted; a raw value with no
+        entry in that list (missing, or an unrecognized category) is encoded as
+        -1, NOT dropped -- confirmed against Ensense's own bundled adult
+        scaler, whose data_min_ is exactly -1.0 for the three columns
+        (workclass, occupation, native-country) that have missing values in the
+        raw data. `.map(index_of)` already returns NaN for both a real missing
+        value and an unrecognized one, so `.fillna(-1)` alone handles both
+        cases without distinguishing them, same as upstream.
 
         Args:
-            df (pd.DataFrame): The input DataFrame.
-            categorical_cols (list[str]): List of categorical column names.
+            df (pd.DataFrame): The raw DataFrame.
+            categorical_cols (list[str]): Categorical columns to encode.
 
         Returns:
-            tuple[pd.DataFrame, dict[str, list[str]]]: The encoded DataFrame and the
-                                                    encoding map.
+            tuple[pd.DataFrame, dict[str, list[str]]]: The encoded
+                DataFrame and its `feature -> sorted categories` map.
         """
 
         encoded: pd.DataFrame = df.copy()
         encoding_map: dict[str, list[str]] = {}
 
         for col in categorical_cols:
-            categories: list[str] = sorted(df[col].unique().tolist())
+            categories: list[str] = sorted(df[col].dropna().unique().tolist())
             encoding_map[col] = categories
             index_of: dict[str, int] = {v: i for i, v in enumerate(categories)}
-            encoded[col] = df[col].map(index_of)
+            encoded[col] = df[col].map(index_of).fillna(-1).astype(int)
 
         return encoded, encoding_map
 
@@ -165,13 +177,17 @@ class DatasetBuilder:
         encoding_map: dict[str, list[str]],
     ) -> None:
         """
-        Encode the label column as ordinal indices, and update the encoding map.
+        If the label is a string column, ordinal-encode it too (sorted,
+        same convention as `_encode_categoricals`) and record it in
+        `encoding_map`; a numeric label is left as-is. Mutates `encoded`
+        in place.
 
         Args:
-            df (pd.DataFrame): The input DataFrame.
-            encoded (pd.DataFrame): The DataFrame with encoded categorical columns.
-            label_col (str): The name of the label column.
-            encoding_map (dict[str, list[str]]): The encoding map to be updated.
+            df (pd.DataFrame): The raw DataFrame (for the label's raw values).
+            encoded (pd.DataFrame): Mutated in place with the encoded label.
+            label_col (str): The label column's name.
+            encoding_map (dict[str, list[str]]): Mutated in place with the
+                label's categories, if encoded.
         """
 
         if is_string_dtype(encoded[label_col]):
@@ -182,21 +198,62 @@ class DatasetBuilder:
             )
 
     @staticmethod
+    def decode_point(
+        raw_point: Mapping[str, float], encoding_map: dict[str, list[str]]
+    ) -> dict[str, str | float]:
+        """
+        Decode one row of already-UNSCALED (raw ordinal-code, not [0,1]) values
+        back to human-readable form, matching Ensense core's own
+        `decode_point` exactly (ensense/src/read_output.py): round a
+        categorical feature to the nearest integer and look it up in its
+        sorted category list; a code outside the list's range (-1 for
+        missing, or a fractional/out-of-domain value from a solver's
+        continuous relaxation) is reported as `"<unknown_{idx}>"` rather than
+        raising. Non-categorical features pass through unchanged. Call
+        `scaler.inverse_transform` first -- this only maps ordinal codes back
+        to category names, it does not undo the [0,1] scaling.
+
+        Args:
+            raw_point (Mapping[str, float]): One row's already-unscaled
+                (raw ordinal-code) values.
+            encoding_map (dict[str, list[str]]): Feature -> sorted categories.
+
+        Returns:
+            dict[str, str | float]: The row with categorical codes decoded
+                to category names (or `"<unknown_{idx}>"`).
+        """
+
+        decoded: dict[str, str | float] = {}
+
+        for feature, value in raw_point.items():
+            if feature in encoding_map:
+                idx: int = int(round(float(value)))
+                categories: list[str] = encoding_map[feature]
+                in_range: bool = 0 <= idx < len(categories)
+                decoded[feature] = categories[idx] if in_range else f"<unknown_{idx}>"
+            else:
+                decoded[feature] = value
+
+        return decoded
+
+    @staticmethod
     def _scale_features(
         encoded: pd.DataFrame, feature_cols: list[str], label_col: str
     ) -> tuple[pd.DataFrame, MinMaxScaler]:
         """
-        Scale the feature columns to [0, 1] using MinMaxScaler, and return the
-        scaled DataFrame and the fitted scaler.
+        Scale the feature columns to [0, 1] with MinMaxScaler fit on the FULL
+        encoded feature matrix (before the train/test split), matching Ensense
+        core's own convention exactly -- see `build_dataset`'s docstring for
+        why this is deliberate and not a leakage bug.
 
         Args:
-            encoded (pd.DataFrame): The DataFrame with encoded categorical columns.
-            feature_cols (list[str]): List of feature column names.
-            label_col (str): The name of the label column.
+            encoded (pd.DataFrame): The encoded DataFrame to scale.
+            feature_cols (list[str]): Feature columns to scale.
+            label_col (str): The label column, appended unscaled.
 
         Returns:
-            tuple[pd.DataFrame, MinMaxScaler]: The scaled DataFrame and the fitted
-                                               scaler.
+            tuple[pd.DataFrame, MinMaxScaler]: The scaled DataFrame and the
+                fitted scaler.
         """
 
         scaler = MinMaxScaler()
@@ -213,17 +270,16 @@ class DatasetBuilder:
         full: pd.DataFrame, label_col: str, test_size: float, seed: int
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
         """
-        Split the full DataFrame into training and testing DataFrames.
+        Stratified train/test split of the already-scaled `full` DataFrame.
 
         Args:
-            full (pd.DataFrame): The full DataFrame.
-            label_col (str): The name of the label column.
-            test_size (float): The proportion of the dataset to include in the test
-                               split.
-            seed (int): The random seed.
+            full (pd.DataFrame): The already-scaled DataFrame to split.
+            label_col (str): The label column, for stratification.
+            test_size (float): Fraction held out for the test split.
+            seed (int): Split seed.
 
         Returns:
-            tuple[pd.DataFrame, pd.DataFrame]: The training and testing DataFrames.
+            tuple[pd.DataFrame, pd.DataFrame]: `(train_df, test_df)`.
         """
 
         train_df, test_df = train_test_split(
@@ -239,13 +295,13 @@ class DatasetBuilder:
         out_dir: Path, full: pd.DataFrame, train_df: pd.DataFrame, test_df: pd.DataFrame
     ) -> None:
         """
-        Write the full, training, and testing DataFrames to CSV files.
+        full.csv keeps its index column; train.csv/test.csv don't.
 
         Args:
-            out_dir (Path): The output directory to write the CSV files to.
-            full (pd.DataFrame): The full DataFrame.
-            train_df (pd.DataFrame): The training DataFrame.
-            test_df (pd.DataFrame): The testing DataFrame.
+            out_dir (Path): Directory to write into.
+            full (pd.DataFrame): The full, scaled dataset.
+            train_df (pd.DataFrame): The training split.
+            test_df (pd.DataFrame): The test split.
         """
 
         full.to_csv(out_dir / "full.csv", index=True)
@@ -255,11 +311,11 @@ class DatasetBuilder:
     @staticmethod
     def _write_scaler(out_dir: Path, scaler: MinMaxScaler) -> None:
         """
-        Write the fitted MinMaxScaler to a pickle file.
+        Pickle the fitted scaler to scaler.pkl.
 
         Args:
-            out_dir (Path): The output directory to write the pickle file to.
-            scaler (MinMaxScaler): The fitted MinMaxScaler.
+            out_dir (Path): Directory to write into.
+            scaler (MinMaxScaler): The fitted scaler to persist.
         """
 
         joblib.dump(scaler, out_dir / "scaler.pkl")
@@ -267,11 +323,11 @@ class DatasetBuilder:
     @staticmethod
     def _write_encoding_map(out_dir: Path, encoding_map: dict[str, list[str]]) -> None:
         """
-        Write the encoding map to a JSON file.
+        Write encoding_map.json, if there were any categorical columns to encode.
 
         Args:
-            out_dir (Path): The output directory to write the JSON file to.
-            encoding_map (dict[str, list[str]]): The encoding map.
+            out_dir (Path): Directory to write into.
+            encoding_map (dict[str, list[str]]): Feature -> sorted categories.
         """
 
         if encoding_map:
@@ -282,12 +338,12 @@ class DatasetBuilder:
         out_dir: Path, feature_cols: list[str], label_col: str
     ) -> None:
         """
-        Write the feature map to a JSON file.
+        Write feature_map.json: each feature column -> "f<i>", label -> "label".
 
         Args:
-            out_dir (Path): The output directory to write the JSON file to.
-            feature_cols (list[str]): The list of feature column names.
-            label_col (str): The name of the label column.
+            out_dir (Path): Directory to write into.
+            feature_cols (list[str]): Feature columns, in order.
+            label_col (str): The label column's name.
         """
 
         feature_map: dict[str, str] = {
@@ -301,12 +357,14 @@ class DatasetBuilder:
         out_dir: Path, feature_cols: list[str], train_df: pd.DataFrame
     ) -> None:
         """
-        Write the details to a CSV file.
+        Write details.csv (feature,name,lb,ub), lb/ub taken from train_df's
+        own min/max -- typically inside but not exactly [0, 1], since the
+        scaler was fit on the full dataset while this reads only train.
 
         Args:
-            out_dir (Path): The output directory to write the CSV file to.
-            feature_cols (list[str]): The list of feature column names.
-            train_df (pd.DataFrame): The training DataFrame.
+            out_dir (Path): Directory to write into.
+            feature_cols (list[str]): Feature columns, in order.
+            train_df (pd.DataFrame): The training split, for lb/ub.
         """
 
         details = pd.DataFrame(

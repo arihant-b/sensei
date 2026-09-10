@@ -38,17 +38,19 @@ class RegionOverlapAnalyzer:
         cuts: list[Cut],
     ) -> OverlapResult:
         """
-        Check the overlap of a fresh counterexample with existing cuts.
+        `fresh_pair`'s (pos, neg) leaf-difference sets match an existing
+        cut's, up to sign (the cut doesn't record which side was x1 vs x2).
 
         Args:
-            booster (xgb.Booster): The XGBoost booster to analyze.
-            leaf_map (LeafMap): The leaf map to use for leaf ID computation.
-            fresh_pair (Pair): The fresh counterexample to check.
-            columns (list[str]): The column names for the input data.
-            cuts (list[Cut]): The existing cuts to compare against.
+            booster (xgb.Booster): The model `fresh_pair` was found against.
+            leaf_map (LeafMap): Global leaf map for `booster`.
+            fresh_pair (Pair): The freshly found counterexample to check.
+            columns (list[str]): All feature names, in model column order.
+            cuts (list[Cut]): Already-accumulated cuts to check overlap against.
 
         Returns:
-            OverlapResult: The result of the overlap check.
+            OverlapResult: Whether `fresh_pair` matched an existing cut,
+                with its own difference sets.
         """
 
         row1 = pd.DataFrame([fresh_pair.x1], columns=columns)
@@ -73,51 +75,19 @@ class RegionOverlapAnalyzer:
         return OverlapResult(False, fresh_pos, fresh_neg)
 
     @staticmethod
-    def overlap_rate(
-        booster: xgb.Booster,
-        leaf_map: LeafMap,
-        fresh_pairs: list[Pair],
-        columns: list[str],
-        cuts: list[Cut],
-    ) -> float:
-        """
-        Fraction of fresh_pairs whose exact difference pattern was already cut.
-
-        Args:
-            booster (xgb.Booster): The XGBoost booster to analyze.
-            leaf_map (LeafMap): The leaf map to use for leaf ID computation.
-            fresh_pairs (list[Pair]): The fresh counterexamples to check.
-            columns (list[str]): The column names for the input data.
-            cuts (list[Cut]): The existing cuts to compare against.
-
-        Returns:
-            float: The overlap rate.
-        """
-
-        if not fresh_pairs:
-            return float("nan")
-
-        matches: int = sum(
-            RegionOverlapAnalyzer.check_overlap(
-                booster, leaf_map, p, columns, cuts
-            ).matched_existing_cut
-            for p in fresh_pairs
-        )
-        return matches / len(fresh_pairs)
-
-    @staticmethod
     def _difference_sets(
         ell1: NDArray[np.int64], ell2: NDArray[np.int64]
     ) -> tuple[frozenset[int], frozenset[int]]:
         """
-        Compute the difference between two sets of leaf IDs.
+        (leaves only in `ell1`, leaves only in `ell2`) -- shared leaves cancel.
 
         Args:
-            ell1 (NDArray[np.int64]): The first set of leaf IDs.
-            ell2 (NDArray[np.int64]): The second set of leaf IDs.
+            ell1 (NDArray[np.int64]): x1's active global leaf indices.
+            ell2 (NDArray[np.int64]): x2's active global leaf indices.
 
         Returns:
-            tuple[frozenset[int], frozenset[int]]: The difference sets.
+            tuple[frozenset[int], frozenset[int]]: `(only in ell1, only in
+                ell2)`.
         """
 
         set1: set[int] = {int(n) for n in ell1}

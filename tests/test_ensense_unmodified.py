@@ -29,7 +29,7 @@ def test_ensense_pin_file_exists_and_is_a_sha() -> None:
 
 
 def test_ensense_vendored_and_present() -> None:
-    assert _ENSENSE_DIR.is_dir(), "ensense/ is missing -- see docs/ensense_interface.md"
+    assert _ENSENSE_DIR.is_dir(), "ensense/ is missing -- vendor the Ensense core first"
     assert (_ENSENSE_DIR / "LICENSE").is_file()
     assert (_ENSENSE_DIR / "src" / "sensitive.py").is_file()
     assert not (_ENSENSE_DIR / ".git").exists(), (

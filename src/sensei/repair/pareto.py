@@ -8,10 +8,7 @@ from sensei.repair.cuts import Cut
 
 @dataclass
 class Snapshot:
-    """
-    A snapshot of the current state of the repair process, capturing key metrics and
-    information about the current iteration.
-    """
+    """One CEGSAL iteration's (v, accuracy, sensitivity) state, for Pareto tracking."""
 
     iteration: int
     v: NDArray[np.float64]
@@ -31,11 +28,11 @@ class ParetoCheckpoint:
 
     def record(self, snapshot: Snapshot) -> None:
         """
-        Record a snapshot of the current state of the repair process.
+        Append to history; update `best` if `snapshot` clears `a_min` and
+        beats it on worst-gap magnitude.
 
         Args:
-            snap (Snapshot): The snapshot to record, containing metrics and information
-                             about the current iteration.
+            snapshot (Snapshot): The iteration's state to record.
         """
 
         self.history.append(snapshot)
@@ -52,11 +49,10 @@ class ParetoCheckpoint:
 
     def restore(self) -> Snapshot | None:
         """
-        Restore the best snapshot recorded during the repair process.
+        The best snapshot recorded so far, or None if none has cleared `a_min`.
 
         Returns:
-            Snapshot | None: The best snapshot recorded, or None if no valid snapshot
-                             was recorded.
+            Snapshot | None: The best snapshot, or None.
         """
 
         return self.best

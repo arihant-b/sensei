@@ -37,88 +37,89 @@ This repository contains SensEI, a tool for **sensitivity repair** of decision t
 `sensei` (the importable package) lives at `src/sensei/` (the standard "src layout" -- `pyproject.toml` discovers it there, and `pip install -e .` points a plain path entry at `src/`, so `import sensei` works and static analyzers/IDEs resolve it too). `experiments/` is deliberately a separate, top-level directory: plain runnable scripts, not part of the installed package.
 
 ```
-dataset/                              # built dataset artifacts (currently: adult) -- see data/builder.py
+dataset/                              # built datasets (csv files, scaler, etc.)
 
 docs/
-└── ensense_interface.md              # inventory of Ensense core's actual input surface
+├── architecture.md                   # system overview: the idea, the loop, the guardrails
+└── technical_overview.md             # from-the-code reference: exact math, per module
 
-ensense/                              # vendored Ensense core, pinned to a commit SHA, read-only, gitignored
+ensense/                              # Ensense's own code (read-only, not ours)
 
-experiments/                          # plain scripts, OUTSIDE the installed package
-├── run_all_features.py               # CertifyPipeline across every P/M feature a spec declares
-├── run_baseline_sweep.py             # run_stage0_baselines across every dataset with a built train.csv
-├── run_stage0_baselines.py           # all four baselines, one dataset
-└── run_stage3_certify.py             # CertifyPipeline for one feature, sourced from defaults.yaml
+experiments/                          # scripts you run from the terminal
+├── run_baseline_sweep.py             # run baselines on every dataset
+├── run_baselines.py                  # run the four baselines
+├── run_certify.py                    # repair one feature and check the result
+└── run_hyperparam_sweep.py           # run run_certify.py across a hyperparameter grid
 
-results/                              # one JSON per experiment or CLI run, append-only, never overwritten
+logs/                                 # one timestamped log file per run (gitignored)
+
+results/                              # one JSON file per run
 
 src/
-└── sensei/                           # the package (standard src-layout, import sensei still works, see above)
-    ├── config/                       # defaults.yaml (eps/theta/mu/kap/seeds/...), ensense_pin.txt
-    │   ├── defaults.yaml             #
-    │   └── ensense_pin.txt           #
-    ├── data/                         # builder.py (raw CSV -> dataset/<name>/), loader.py, bins.py, preprocess.py
-    │   ├── bins.py                   #
-    │   ├── builder.py                #
-    │   ├── loader.py                 #
-    │   └── preprocess.py             #
-    ├── eval/                         # metrics.py, baselines.py, heldout_verify.py, region_overlap.py, sweeps.py
-    │   ├── baselines.py              #
-    │   ├── heldout_verify.py         #
-    │   ├── metrics.py                #
-    │   ├── region_overlap.py         #
-    │   └── sweeps.py                 #
-    ├── model/                        # train.py, leaves.py (leaf indexing + phi(x)), freeze.py
-    │   ├── freeze.py                 #
-    │   ├── leaves.py                 #
-    │   └── train.py                  #
-    ├── oracle/
-    │   ├── base.py                   #
-    │   ├── ensense_adapter.py        # Tier B: TierBOracle, one method per Ensense solver family (pb, milp)
-    │   ├── types.py                  #
-    │   └── milp/                     # Tier A: sensei's own MILP oracle (encoding, no-goods, warm starts, solve)
-    │       ├── encoding.py           #
-    │       ├── nogoods.py            #
-    │       ├── solve.py              #
-    │       └── warm_start.py         #
-    ├── repair/                       # cuts.py, qp.py (soft-slack repair QP), loop.py (CEGSAL), pareto.py
-    │   ├── cuts.py                   #
-    │   ├── loop.py                   #
-    │   ├── pareto.py                 #
-    │   └── qp.py                     #
-    ├── spec/                         # per-dataset protected/monotone/immutable groups + preprocessing decisions
-    │   ├── adult.yaml                #
-    │   ├── churn.yaml                #
-    │   ├── german_credit.yaml        #
-    │   └── pimadiabetes.yaml         #
-    ├── validity/                     # type/FD/domain/plausibility rules, MILP constraint export, postfilter
-    │   ├── domain_rules.py           #
-    │   ├── encode_milp.py            #
-    │   ├── fd_rules.py               #
-    │   ├── plausibility.py           #
-    │   ├── postfilter.py             #
-    │   └── type_rules.py             #
-    ├── pipeline.py                   # CertifyPipeline: the search->repair->verify->sweep pipeline, shared by
-    │                                   experiments/run_stage3_certify.py and the `sensei` CLI
-    ├── args.py                       # sensei CLI's argument parsing -- used INSTEAD OF defaults.yaml for that
-    │                                   entry point (see Command-Line Interface below)
-    └── cli.py                        # `sensei` console command's entry point (args.py -> pipeline.py -> JSON)
+└── sensei/                           # the sensei package
+    ├── config/                       # settings
+    │   ├── defaults.yaml             # default hyperparameters
+    │   └── ensense_pin.txt           # exact Ensense version we use
+    ├── data/                         # building and loading datasets
+    │   ├── bins.py                   # groups feature values into bins
+    │   ├── builder.py                # turns a raw CSV into a dataset
+    │   └── loader.py                 # loads a built dataset
+    ├── eval/                         # measuring and checking models
+    │   ├── heldout_verify.py         # re-checks a repair with Ensense
+    │   ├── metrics.py                # accuracy and sensitivity scores
+    │   ├── plots.py                  # saves the per-run diagnostic plots
+    │   ├── region_overlap.py         # checks if a fix already covers a case
+    │   ├── results_writer.py         # writes one results JSON per run
+    │   └── sweeps.py                 # repeats a check across many settings
+    ├── model/                        # training and reading the model
+    │   ├── baselines.py              # trains the four baseline comparison models
+    │   ├── leaves.py                 # reads and edits leaf values
+    │   └── train.py                  # trains an XGBoost model
+    ├── oracle/                       # finds unfair pairs of inputs
+    │   ├── types.py                  # shared data types (Pair, NoGood, TreeStructure, ...)
+    │   ├── ensense/                  # wraps Ensense core
+    │   │   └── adapter.py            # asks Ensense to find a pair
+    │   └── sensei/                   # our own oracle
+    │       ├── encoding.py           # writes the model as MILP constraints
+    │       ├── nogoods.py            # blocks a solution we already saw
+    │       ├── solve.py              # runs our oracle
+    │       └── warm_start.py         # reuses the last solution to solve faster
+    ├── repair/                       # fixing unfair pairs
+    │   ├── cuts.py                   # turns a pair into a constraint
+    │   ├── loop.py                   # the main search-fix-repeat loop
+    │   ├── pareto.py                 # keeps the best model seen so far
+    │   └── qp.py                     # solves the fix as an optimization problem
+    ├── spec/                         # per-dataset settings
+    │   ├── adult.yaml                # settings for the adult dataset
+    │   ├── churn.yaml                # settings for the churn dataset
+    │   ├── german_credit.yaml        # settings for the german credit dataset
+    │   └── pimadiabetes.yaml         # settings for the diabetes dataset
+    ├── validity/                     # checking if an input is realistic
+    │   ├── domain_rules.py           # checks simple rules between features
+    │   ├── encode_milp.py            # adds these rules to our oracle
+    │   ├── fd_rules.py               # checks features that must match
+    │   ├── plausibility.py           # scores how realistic an input is
+    │   ├── postfilter.py             # rejects bad inputs from Ensense
+    │   └── type_rules.py             # checks types, ranges, and categories
+    ├── pipeline.py                   # runs search, repair, and checks together
+    ├── args.py                       # reads command-line options
+    ├── logging_setup.py              # configures console + logs/ file logging
+    └── cli.py                        # the `sensei` command
 
 tests/
-├── test_bins_frozen.py               #
-├── test_domain_rules.py              #
-├── test_ensense_unmodified.py        #
-├── test_leaf_roundtrip.py            #
-├── test_milp_agrees_with_ensense.py  #
-├── test_postfilter.py                #
-└── test_stage1_appendix_example3.py  #
+├── test_bins_frozen.py               # checks bins don't change by accident
+├── test_domain_rules.py              # checks domain rule logic
+├── test_ensense_unmodified.py        # checks Ensense's code wasn't edited
+├── test_leaf_roundtrip.py            # checks leaf values save and load correctly
+├── test_milp_agrees_with_ensense.py  # checks our oracle agrees with Ensense
+└── test_postfilter.py                # checks bad inputs get rejected
 ```
 
 **Key files:**
 
-- `repair/qp.py` and `repair/loop.py` hold the core contribution: the soft-slack repair QP and the CEGSAL search-cut-repair loop.
-- `oracle/ensense_adapter.py` is the only integration point with the vendored Ensense core (Tier B); `oracle/milp/` is sensei's own independent oracle (Tier A), used both to repair and, via a fresh Ensense call, to be checked by something other than itself.
-- `pipeline.py` is the single implementation both `experiments/run_stage3_certify.py` and the `sensei` command run -- they only differ in where they get their settings from.
+- `repair/qp.py` and `repair/loop.py` do the actual repair.
+- `oracle/ensense/adapter.py` talks to Ensense; `oracle/sensei/` is our own oracle.
+- `pipeline.py` runs the whole repair-and-check process, used by both the CLI and the experiment scripts.
 
 ---
 
@@ -153,7 +154,7 @@ git clone https://github.com/formal-trust-AI/ensense.git ensense
 git -C ensense checkout $(cat src/sensei/config/ensense_pin.txt)
 ```
 
-See `docs/ensense_interface.md` for what Ensense core's own CLI/API actually exposes (seeds, time limits, UNSAT-vs-timeout ambiguity, etc.) &mdash; found by reading the vendored source, not assumed.
+See `docs/architecture.md` for what was found by reading the vendored source, not assumed.
 
 ### Hardware
 
@@ -186,11 +187,11 @@ Verify:
 
 ```bash
 pytest tests/ -q
-python experiments/run_stage0_baselines.py --dataset adult
+python experiments/run_baselines.py --dataset adult
 sensei --help
 ```
 
-The test suite covers leaf round-tripping, cut/no-good construction, Tier A vs. Ensense SAT/UNSAT agreement, and the Stage 1 Appendix Example 3 deliverable. `run_stage0_baselines` trains and evaluates all four baselines on the `adult` dataset and writes a results JSON. `sensei --help` should print the CLI's usage without error.
+The test suite covers leaf round-tripping, cut/no-good construction, sensei-oracle vs. Ensense SAT/UNSAT agreement, plausibility bin freezing, domain-rule checks, the Ensense postfilter's rejection budget, and that `ensense/` matches its pinned SHA. `run_baselines` trains and evaluates all four baselines on the `adult` dataset and writes a results JSON. `sensei --help` should print the CLI's usage without error.
 
 ---
 
@@ -207,14 +208,14 @@ sensei --dataset adult --feature sex
 Equivalently, without installing the console command, the same pipeline is runnable as a script:
 
 ```bash
-python experiments/run_stage3_certify.py --dataset adult --feature sex
+python experiments/run_certify.py --dataset adult --feature sex
 ```
 
-Either way, this trains M0, runs CEGSAL to repair sensitivity to `sex`, then independently re-checks the repair with a fresh call into Ensense core, runs a required `theta` sweep and a companion `eps` sweep, and writes one results JSON. One real run (`results/stage3_certify_adult_sex_*.json`, 30 trees/depth 4) landed on a `ParetoBest` snapshot after 12 rounds (`iteration_cap`): worst gap dropped to `0.2559`, accuracy `0.8707`, sensitivity rate `0.025`, 60 cuts, zero slack. Held-out verification against Ensense core still found a fresh violation there (gap `0.1217`, region-overlap rate `0.0`) &mdash; an honest negative result, reported as such rather than hidden (see [Held-out Verification](#held-out-verification)).
+Either way, this trains M0, runs CEGSAL to repair sensitivity to `sex`, then independently re-checks the repair with a fresh call into Ensense core, runs a required `theta` sweep and a companion `eps` sweep, and writes one results JSON. One real run (`results/certify_adult_sex_*.json`, 30 trees/depth 4) landed on a `ParetoBest` snapshot after 12 rounds (`iteration_cap`): worst gap dropped to `0.2559`, accuracy `0.8707`, sensitivity rate `0.025`, 60 cuts, zero slack. Held-out verification against Ensense core still found a fresh violation there (gap `0.1217`, region-overlap rate `0.0`) &mdash; an honest negative result, reported as such rather than hidden (see [Held-out Verification](#held-out-verification)).
 
 ### Command-Line Interface
 
-`sensei` (installed by `pip install -e .`, see [Installation](#installation)) runs the same search -> repair -> verify -> sweep pipeline as `experiments/run_stage3_certify.py`, but is driven entirely by CLI flags instead of `src/sensei/config/defaults.yaml` -- `src/sensei/args.py` defines one optional flag per `defaults.yaml` field, at that file's own default value, so an unconfigured invocation behaves identically to the YAML-driven experiment script. Run `sensei --help` for the full, current list; the required and most commonly-overridden flags are:
+`sensei` (installed by `pip install -e .`, see [Installation](#installation)) runs the same search -> repair -> verify -> sweep pipeline as `experiments/run_certify.py`, but is driven entirely by CLI flags instead of `src/sensei/config/defaults.yaml` -- `src/sensei/args.py` defines one optional flag per `defaults.yaml` field, at that file's own default value, so an unconfigured invocation behaves identically to the YAML-driven experiment script. Run `sensei --help` for the full, current list; the required and most commonly-overridden flags are:
 
 | Flag                                                                  | Required? | Default                   | Meaning                                                                    |
 | --------------------------------------------------------------------- | --------- | ------------------------- | -------------------------------------------------------------------------- |
@@ -222,13 +223,16 @@ Either way, this trains M0, runs CEGSAL to repair sensitivity to `sex`, then ind
 | `--feature`                                                           | **yes**   | &mdash;                   | feature to repair sensitivity to                                           |
 | `--direction`                                                         | no        | `protected`               | `protected` or `monotone_wrong`                                      |
 | `--eps`                                                               | no        | `0.10`                    | sensitivity budget, margin space                                           |
-| `--theta`                                                             | no        | `1e-6`                    | plausibility threshold                                                     |
-| `--mu`, `--kap`                                                       | no        | `0.01`, `100.0`           | proximal weight, slack price                                        |
+| `--theta`                                                             | no        | `1e-9`                    | plausibility threshold                                                     |
+| `--gap`                                                               | no        | `0.30`                    | Ensense's confident-flip margin, probability space (`output_gap=(gap, 1-gap)`); avoid `0.5`, a zero-width band Ensense's own solver mishandles |
+| `--mu`, `--kap`                                                       | no        | `0.1`, `100.0`            | proximal weight, slack price                                        |
 | `--n-estimators`, `--max-depth`                                       | no        | `200`, `5`                | M0's size                                                                  |
 | `--max-iters`, `--a-min`, `--stall-delta`, `--cuts-per-round`         | no        | `50`, `0.82`, `1e-3`, `5` | CEGSAL stop conditions                                              |
 | `--oracle-time-limit-s`, `--oracle-mip-gap`                           | no        | `300.0`, `0.05`           | per-call Gurobi limits                                                     |
+| `--oracle-type`                                                       | no        | `sensei`                  | `sensei` (own MILP) or `ensense` (Ensense core + postfilter, weaker) |
+| `--oracle-method`                                                     | no        | `milp`                    | which Ensense core solver family to call (`pb` or `milp`) whenever Ensense core is used |
 | `--n-quantile-bins`                                                   | no        | `10`                      | plausibility bins                                                   |
-| `--data-split-seed`, `--model-train-seed`, `--baseline4-retrain-seed` | no        | `42` each                 | pass seeds explicitly, never a global default                         |
+| `--seed`                                                              | no        | `42`                      | single global seed: data split, model training, oracle search sampling, baseline retraining |
 | `--results-dir`                                                       | no        | `results/`                | where the output JSON is written, relative to your current directory       |
 
 ```bash
@@ -250,22 +254,24 @@ monotone:
 immutable: [native-country]
 
 # --- Q1 type validity ---
+# Every ordinal-encoded categorical (workclass, education, marital-status,
+# race, sex, ...) belongs here too, not just the genuinely-numeric features --
+# data/builder.py encodes each one as a raw ordinal index, so its raw value
+# is always an integer. Omitting a categorical lets the oracle propose a
+# fractional category code that doesn't correspond to any real category.
 integer_features:
-  [age, education-num, hours-per-week, capital-gain, capital-loss]
+  [age, education-num, hours-per-week, capital-gain, capital-loss,
+   workclass, education, marital-status, occupation, relationship,
+   race, sex, native-country]
 one_hot_groups: {}
 ranges:
   age: [0.0, 1.0]
-  hours-per-week: [0.0, 1.0]
-functional_deps:
-  - [education, 0.6666666666666666, education-num, 1.0]
-
-# --- Tier B1 preprocessing decisions ---
-preprocessing:
-  drop_fd_redundant_columns: []
-  integer_code_features: []
+  hours-per-week: [0.0, 0.9999999999999999]
+  # ... one entry per feature, taken verbatim from dataset/adult/details.csv
+functional_deps: []
 ```
 
-`ranges`/`functional_deps` values are in the same min-max-scaled `[0, 1]` space `data/builder.py` writes to `dataset/<name>/train.csv`, not raw units.
+`ranges`/`functional_deps` values are in the same min-max-scaled `[0, 1]` space `data/builder.py` writes to `dataset/<name>/train.csv`, not raw units -- the same `details.csv` Ensense core's own search uses for its bounds (`oracle/ensense/adapter.py`'s `_details_csv_for`), so the spec and Ensense's own domain are drawn from one source of truth.
 
 ### Tuning Main Parameters
 
@@ -275,36 +281,47 @@ preprocessing:
 | `theta`          | Plausibility threshold                             | Fewer counterexamples accepted; too high shrinks the plausible region until UNSAT is trivial &mdash; always report as a sweep, never one value |
 | `mu`             | Proximal weight on `\|\|v - v0\|\|^2`              | Safer on unseen inputs, more resistance to repair                                                                                              |
 | `kap`            | Slack price on cut violations                      | Cuts bind harder (slack toward 0), at more accuracy cost                                                                                       |
-| `gap`            | Ensense's confident-flip margin, probability space | Only confident flips count in Tier B calls                                                                                                     |
-| `cuts_per_round` | Cuts batched per oracle call before repairing      | Fewer MILP calls, possibly redundant cuts                                                                                                      |
+| `gap`            | Ensense's confident-flip margin, probability space | Only confident flips count in ensense-oracle calls; avoid `0.5` (zero-width band, mishandled by Ensense's own solver)                          |
+| `oracle.method`  | Which Ensense solver family (`pb` or `milp`)       | Different solver, different runtime/results whenever Ensense core is used                                                                      |
+| `cuts_per_round` | Cuts batched per oracle call before repairing      | Fewer MILP calls, possibly redundant cuts (no effect for the ensense oracle, which has no no-goods to diversify with -- one search per round)  |
 
 ### Programmatic Use
 
 ```python
+import dataclasses
+
+from sensei.config import load_defaults
 from sensei.data.loader import Dataset
 from sensei.spec import load_spec
 from sensei.model.train import Trainer
 from sensei.repair.loop import CegsalLoop, ConditionalCertificate
 
-spec = load_spec("adult")
-ds = Dataset("adult", eval_holdout=0.2, seed=42).load()
-booster = Trainer.train_baseline(ds.X_train, ds.y_train, n_estimators=30, max_depth=4, seed=42)
-
-result = CegsalLoop(
-    booster, ds.X_train, ds.y_train, ds.X_test, ds.y_test,
-    ds.columns, ds.feature_bounds, spec, seed=42,
-).run(
-    flip_set=("sex",), direction="protected",
-    eps=0.10, theta=1e-6, mu=0.01, kap=100.0,
-    max_iters=15, a_min=0.82, stall_delta=1e-3, cuts_per_round=5,
-    oracle_time_limit_s=30.0, oracle_mip_gap=0.05,
+settings = load_defaults()  # every hyperparameter comes from config/defaults.yaml
+settings = dataclasses.replace(
+    settings,
+    model=dataclasses.replace(settings.model, n_estimators=30, max_depth=4),
+    loop=dataclasses.replace(settings.loop, max_iters=15),
 )
+
+spec = load_spec("adult")
+ds = Dataset("adult", eval_holdout=settings.dataset.eval_holdout, seed=settings.seed).load()
+booster = Trainer.train_baseline(
+    ds.X_train, ds.y_train, settings.model.n_estimators, settings.model.max_depth, settings.seed
+)
+
+loop = CegsalLoop(
+    booster, ds.X_train, ds.y_train, ds.X_test, ds.y_test,
+    ds.columns, ds.feature_bounds, spec, settings,
+)
+result = loop.run(flip_set=("sex",), direction="protected")
 
 if isinstance(result, ConditionalCertificate):
     print(result.statement())
 else:
     print(type(result).__name__, result.snapshot.worst_gap, result.snapshot.accuracy)
 ```
+
+`CegsalLoop` takes one `Settings` object (fixed for the loop's lifetime) instead of separate `eps`/`theta`/`mu`/... arguments -- override just the fields you need via `dataclasses.replace` before constructing it, as above. This is the same `Settings` object `sensei.args.parse_args()`/`load_defaults()` produce, so CLI runs and programmatic use share one config shape.
 
 ### Interpreting Output
 
@@ -318,7 +335,7 @@ else:
 
 ### Debugging
 
-There's no dedicated debug flag. Increase verbosity by editing the `logging.basicConfig` call in an experiment script's or `sensei.cli`'s `main()`, or use the pieces directly (see [Programmatic Use](#programmatic-use)) and inspect `result.snapshot.cuts` yourself &mdash; each `Cut` (`repair/cuts.py`) carries its own sparse leaf indices and coefficients. Every run's full parameters and final snapshot land in `results/` regardless of verbosity &mdash; start there before adding logging.
+There's no dedicated debug flag. Every entry point (the experiment scripts and `sensei.cli`) calls `sensei.logging_setup.setup_logging(name)`, which writes a full, timestamped log to `logs/<name>_<timestamp>.log` in addition to the console -- read that first. Increase verbosity by passing a different `level` to `setup_logging`, or use the pieces directly (see [Programmatic Use](#programmatic-use)) and inspect `result.snapshot.cuts` yourself &mdash; each `Cut` (`repair/cuts.py`) carries its own sparse leaf indices and coefficients. Every run's full parameters and final snapshot also land in `results/` regardless of verbosity.
 
 ---
 
@@ -326,42 +343,39 @@ There's no dedicated debug flag. Increase verbosity by editing the `logging.basi
 
 ### Datasets
 
-| Dataset       | Spec (`src/sensei/spec/`)         | Dataset artifacts (`dataset/`) | Protected `P`              | Monotone `M`                            |
-| ------------- | --------------------------------- | ------------------------------ | -------------------------- | --------------------------------------- |
-| Adult         | reviewed                          | built                          | `sex`, `race`              | `education-num` up, `hours-per-week` up |
-| German credit | drafted, preprocessing UNREVIEWED | not yet built                  | `PersonalStatusSex`, `Age` | `CreditAmount` down, `Duration` down    |
-| Pima diabetes | drafted, preprocessing UNREVIEWED | not yet built                  | &mdash;                    | `Glucose` up                            |
-| Churn         | drafted, preprocessing UNREVIEWED | not yet built                  | `gender`, `SeniorCitizen`  | `tenure` up                             |
+| Dataset       | Spec (`src/sensei/spec/`) | Dataset artifacts (`dataset/`) | Protected `P`              | Monotone `M`                            |
+| ------------- | -------------------------- | ------------------------------ | -------------------------- | --------------------------------------- |
+| Adult         | reviewed                   | built                          | `sex`, `race`              | `education-num` up, `hours-per-week` up |
+| German credit | drafted, UNREVIEWED        | built                          | `PersonalStatusSex`, `Age` | `CreditAmount` down, `Duration` down    |
+| Pima diabetes | drafted, UNREVIEWED        | built                          | &mdash;                    | `Glucose` up                            |
+| Churn         | drafted, UNREVIEWED        | built                          | `gender`, `SeniorCitizen`  | `tenure` up                             |
 
-Only `adult` currently has built dataset artifacts. The others need `src/sensei/data/builder.py` run against their raw CSVs, and their preprocessing decisions confirmed, before any stage will work on them.
+All four have built dataset artifacts; only `adult`'s spec has been reviewed. `dataset/` also holds a few datasets built for baseline comparisons only (`breast_cancer`, `diabetes`, `ijcnn`, `iris`, `winequality_red`) -- these have no `spec/*.yaml`, so `sensei --dataset <name> ...` (certify) doesn't work on them, only `run_baselines.py`/`run_baseline_sweep.py`. Run `src/sensei/data/builder.py` against a raw CSV to add a new one.
 
-### Running Stages
+### Running Experiments
 
 ```bash
-# Stage 0 -- all four baselines, one dataset
-python experiments/run_stage0_baselines.py --dataset adult
+# all four baselines, one dataset
+python experiments/run_baselines.py --dataset adult
 
 # ...or across every dataset that currently has a built train.csv
 python experiments/run_baseline_sweep.py
 
-# Stage 1 (Tier B validity) and Stage 2 (Tier A oracle + repair QP) are library
-# code, not separate CLI stages -- exercised by tests/test_stage1_appendix_example3.py,
-# tests/test_milp_agrees_with_ensense.py, and by Stage 3 itself.
+# Ensense-oracle validity and the sensei oracle + repair QP are library code,
+# not separate CLI entry points -- exercised by
+# tests/test_milp_agrees_with_ensense.py and by run_certify.py itself.
 
-# Stage 3 -- repair one flip set via CEGSAL, held-out verify, region-overlap,
-# theta sweep (required) + eps sweep, Tier A vs Tier B comparison
-python experiments/run_stage3_certify.py --dataset adult --feature sex \
+# repair one flip set via CEGSAL, held-out verify, region-overlap,
+# theta sweep (required) + eps sweep, sensei vs. ensense oracle comparison
+python experiments/run_certify.py --dataset adult --feature sex \
     --n-estimators 30 --max-depth 4 --max-iters 15 --oracle-time-limit-s 30
-
-# ...or across every protected/monotone feature a dataset's spec declares
-python experiments/run_all_features.py --dataset adult
 ```
 
-Each run writes one JSON to `results/`. The installed `sensei` command (see [Command-Line Interface](#command-line-interface)) runs the single-feature Stage 3 pipeline too, sourced from CLI flags instead of `defaults.yaml`.
+Each run writes one JSON to `results/`. The installed `sensei` command (see [Command-Line Interface](#command-line-interface)) runs the same single-feature certify pipeline too, sourced from CLI flags instead of `defaults.yaml`.
 
 ### Held-out Verification
 
-**Never skipped.** `run_stage3_certify.py` automatically re-checks the repaired model with a fresh call into the vendored Ensense core (Tier B) &mdash; a genuinely different implementation than the Tier A MILP that did the repairing, not merely a different seed on the same solver (Ensense core's own seed is a hardcoded module constant, not exposed to callers &mdash; see `docs/ensense_interface.md`).
+**Never skipped.** `run_certify.py` automatically re-checks the repaired model with a fresh call into the vendored Ensense core (via `EnsenseOracle`) &mdash; a genuinely different implementation than the `SenseiOracle` MILP that did the repairing, not merely a different seed on the same solver (Ensense core's own seed is a hardcoded module constant, not exposed to callers &mdash; see `docs/architecture.md`).
 
 - fresh UNSAT &rarr; the repair generalized
 - fresh SAT &rarr; the repair patched specific cases, not the property &mdash; reported as `heldout_verify.generalized: false` in the results JSON, not hidden
@@ -370,13 +384,13 @@ The one real end-to-end run so far found the latter: worst gap fell to `0.256` o
 
 ### Metrics
 
-Frozen after Stage 0 (`eval/metrics.py::Metrics`, `VERSION`):
+Frozen by design (`eval/metrics.py::Metrics`, `VERSION`):
 
 | Metric           | Definition                                                                                                                                  |
 | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
 | Accuracy         | test accuracy on `D_eval`                                                                                                                   |
 | Sensitivity rate | fraction of held-out rows whose prediction flips when a protected feature is flipped                                                        |
-| Worst valid gap  | max signed gap from the Tier A oracle in `mode="optimality"`, at the current `theta`; `NaN` (logged) on `EMPTY_DOMAIN`, never a silent zero |
+| Worst valid gap  | max signed gap from the sensei oracle (default) in `mode="optimality"`, at the current `theta`; `NaN` (logged) on `EMPTY_DOMAIN`, never a silent zero |
 | Slack mass       | `sum(s_i)` at repair termination                                                                                                            |
 
 Changing a definition invalidates every earlier result and requires bumping `Metrics.VERSION`.
@@ -396,7 +410,7 @@ Baselines 2 and 3 are built-in tools that partially address the problem and will
 
 ### Reproducibility
 
-Every experiment run writes one JSON to `results/<stage>_<dataset>[_<feature>]_<timestamp>.json`, never overwritten: git SHA, the vendored Ensense pin SHA, dataset, spec hash, every hyperparameter (`eps`/`theta`/`mu`/`kap` for Stage 3, `metrics_version` for Stage 0), seeds, and the full outcome. Seeds are fixed in `src/sensei/config/defaults.yaml`'s `seeds:` block (or via the `sensei` CLI's `--data-split-seed`/`--model-train-seed`/`--baseline4-retrain-seed` flags); there's no built-in multi-seed runner yet, so reporting across seeds means invoking the experiment script (or CLI) once per seed.
+Every experiment run writes one JSON to `results/<kind>_<dataset>[_<feature>]_<timestamp>.json`, never overwritten: git SHA, the vendored Ensense pin SHA, dataset, spec hash, every hyperparameter (`eps`/`theta`/`mu`/`kap` for a certify run, `metrics_version` for a baselines run), the seed, and the full outcome. There's a single global seed, fixed in `src/sensei/config/defaults.yaml`'s `seed:` field (or via the `sensei` CLI's `--seed` flag); there's no built-in multi-seed runner yet, so reporting across seeds means invoking the experiment script (or CLI) once per seed.
 
 ---
 

@@ -1,4 +1,6 @@
+import dataclasses
 import logging
+import re
 import subprocess
 from pathlib import Path
 
@@ -8,13 +10,15 @@ from sensei.config import Settings, ensense_pin
 from sensei.data.bins import FrozenBins
 from sensei.data.loader import Dataset
 from sensei.eval.heldout_verify import HeldoutResult, HeldoutVerifier
-from sensei.eval.region_overlap import RegionOverlapAnalyzer
+from sensei.eval.metrics import Metrics
+from sensei.eval.plots import ResultsPlotter
 from sensei.eval.sweeps import Sweeper, SweepPoint
 from sensei.model.leaves import LeafMap
 from sensei.model.train import Trainer
-from sensei.oracle.milp.encoding import TreeEncoder, TreeStructure
-from sensei.oracle.milp.solve import TierAOracle
-from sensei.oracle.types import Pair
+from sensei.oracle.sensei.encoding import TreeEncoder
+from sensei.oracle.sensei.solve import SenseiOracle
+from sensei.oracle.types import Pair, TreeStructure
+from sensei.repair.cuts import Cut
 from sensei.repair.loop import (
     CegsalLoop,
     ConditionalCertificate,
@@ -26,39 +30,54 @@ from sensei.spec import Spec, load_spec
 
 log: logging.Logger = logging.getLogger("sensei.pipeline")
 
-_DATASET_ROOT: Path = Path(__file__).resolve().parents[2] / "dataset"
+
+def _safe_filename(label: str) -> str:
+    """
+    Turn a schedule label like 'protected_pair:(sex,race)' into a
+    filename-safe stem.
+
+    Args:
+        label (str): The label to sanitize.
+
+    Returns:
+        str: The filename-safe stem.
+    """
+
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", label).strip("_")
 
 
 class CertifyPipeline:
     """
-    The CertifyPipeline orchestrates the entire process of loading a dataset, training a
-    model, repairing it using the CEGSAL loop, and performing various verification and
-    sweep analyses.
+    The search -> repair -> verify -> sweep pipeline: load data, train M0,
+    run CEGSAL, then held-out verify + theta/eps sweep the result. Shared by
+    `experiments/run_certify.py` and the `sensei` CLI -- one implementation,
+    two `Settings` sources.
     """
 
     def run(
         self, dataset: str, feature: str, direction: str, settings: Settings
     ) -> dict:
         """
-        Run the certification pipeline.
+        Run the full pipeline for one `feature`/`direction`: load data,
+        train M0, run CEGSAL, then held-out verify + theta/eps sweep.
 
         Args:
-            dataset (str): The name of the dataset to load and process.
-            feature (str): The name of the feature to analyze.
-            direction (str): The direction of the analysis.
-            settings (Settings): The settings for the certification pipeline.
+            dataset (str): Dataset name, matching `dataset/<name>/` and
+                `spec/<name>.yaml`.
+            feature (str): Feature to repair sensitivity to.
+            direction (str): `"protected"` or `"monotone_wrong"`.
+            settings (Settings): Every hyperparameter for this run.
 
         Returns:
-            dict: A dictionary containing the results of the certification process,
-                  including the exit reason, snapshot details, and results of various
-                  verification and sweep analyses.
+            dict: The results JSON payload (also written to disk by the
+                caller via `ResultsWriter`).
         """
 
         spec: Spec = load_spec(dataset)
         ds: Dataset = Dataset(
             dataset,
             eval_holdout=settings.dataset.eval_holdout,
-            seed=settings.seeds.data_split,
+            seed=settings.seed,
         ).load()
 
         log.info(
@@ -68,6 +87,7 @@ class CertifyPipeline:
         )
 
         assert ds.X_train is not None and ds.y_train is not None
+        assert ds.X_test is not None and ds.y_test is not None
         assert ds.columns is not None and ds.feature_bounds is not None
 
         booster: Booster = Trainer.train_baseline(
@@ -75,11 +95,11 @@ class CertifyPipeline:
             ds.y_train,
             settings.model.n_estimators,
             settings.model.max_depth,
-            settings.seeds.model_train,
+            settings.seed,
         )
 
         log.info("--- CEGSAL: repairing '%s' ---", feature)
-        result: ConditionalCertificate | ParetoBest | Inconclusive = CegsalLoop(
+        loop = CegsalLoop(
             booster,
             ds.X_train,
             ds.y_train,
@@ -88,42 +108,36 @@ class CertifyPipeline:
             ds.columns,
             ds.feature_bounds,
             spec,
-            settings.seeds.model_train,
-        ).run(
-            flip_set=(feature,),
-            direction=direction,
-            eps=settings.sensitivity.eps,
-            theta=settings.sensitivity.theta,
-            mu=settings.repair.mu,
-            kap=settings.repair.kap,
-            max_iters=settings.loop.max_iters,
-            a_min=settings.loop.A_min,
-            stall_delta=settings.loop.stall_delta,
-            cuts_per_round=settings.loop.cuts_per_round,
-            oracle_time_limit_s=settings.oracle.time_limit_s,
-            oracle_mip_gap=settings.oracle.mip_gap,
-            n_quantile_bins=settings.bins.n_quantile_bins,
+            settings,
+            ds.categorical_levels,
+        )
+        result: ConditionalCertificate | ParetoBest | Inconclusive = loop.run(
+            flip_set=(feature,), direction=direction
         )
 
         exit_kind: str = type(result).__name__
         log.info("CEGSAL exit: %s", exit_kind)
 
+        plotter = ResultsPlotter(
+            label=f"{dataset}_{feature}_{direction}",
+            hyperparams=self._plot_hyperparams(settings),
+        )
+        self._plot_training_history(plotter, loop.history)
+
         payload: dict = {
             "git_sha": self._git_sha(),
             "ensense_pin": ensense_pin(),
-            "stage": "stage3_certify",
             "dataset": dataset,
             "feature": feature,
             "direction": direction,
+            "plots_dir": str(plotter.run_dir),
             "spec_hash": spec.spec_hash,
             "eps": settings.sensitivity.eps,
             "theta": settings.sensitivity.theta,
             "mu": settings.repair.mu,
             "kap": settings.repair.kap,
-            "seeds": {
-                "data_split": settings.seeds.data_split,
-                "model_train": settings.seeds.model_train,
-            },
+            "oracle_type": settings.oracle.type,
+            "seed": settings.seed,
             "cegsal_exit": exit_kind,
         }
 
@@ -154,64 +168,153 @@ class CertifyPipeline:
         }
 
         leaf_map = LeafMap(booster)
+        X_eval, y_eval = ds.X_eval, ds.y_eval
+        payload["snapshot"]["eval_accuracy"] = Metrics.accuracy(
+            booster, leaf_map, X_eval, y_eval, snapshot.v
+        )
+        payload["snapshot"]["eval_sensitivity_rate"] = Metrics.sensitivity_rate(
+            booster,
+            leaf_map,
+            X_eval,
+            spec.protected,
+            snapshot.v,
+            seed=settings.seed,
+        )
+
         repaired_booster: Booster = leaf_map.write_leaf_values(booster, snapshot.v)
         structure: TreeStructure = TreeEncoder.extract_tree_structure(
             booster, leaf_map.leaf_index, ds.columns
         )
-        bins: FrozenBins = FrozenBins(settings.bins.n_quantile_bins).fit(
-            ds.X_train, ds.columns
+        bins: FrozenBins = FrozenBins.fit_or_load(
+            dataset,
+            settings.seed,
+            settings.bins.n_quantile_bins,
+            ds.X_train,
+            ds.columns,
+            ds.categorical_levels,
         )
-        details_csv: Path = _DATASET_ROOT / dataset / "details.csv"
+        payload.update(
+            self._verify_flip_set(
+                repaired_booster,
+                booster,
+                ds,
+                spec,
+                bins,
+                structure,
+                (feature,),
+                direction,
+                snapshot.v,
+                snapshot.cuts,
+                settings,
+                plotter,
+                f"{direction}:{feature}",
+            )
+        )
 
+        return payload
+
+    def _verify_flip_set(
+        self,
+        repaired_booster: Booster,
+        booster: Booster,
+        ds: Dataset,
+        spec: Spec,
+        bins: FrozenBins,
+        structure: TreeStructure,
+        flip_set: tuple[str, ...],
+        direction: str,
+        v,
+        cuts: list[Cut],
+        settings: Settings,
+        plotter: ResultsPlotter,
+        stage_label: str,
+    ) -> dict:
+        """
+        Held-out verification (Ensense oracle, fresh), a Sensei oracle
+        self-check, and theta/eps sweeps for ONE flip_set/direction against a
+        fixed, already-repaired `v`. Called once by `run`.
+
+        `plotter`/`stage_label` are used only to save the theta/eps sweep
+        plots (`<plotter.run_dir>/theta_sweep__<stage_label>.png` etc.) --
+        every OTHER plot (per-iteration diagnostics, Pareto curves) is saved
+        by the caller directly from `CegsalLoop.history`/`.stage_history`,
+        which this method has no access to.
+
+        Args:
+            repaired_booster (Booster): The repaired model to verify.
+            booster (Booster): The unrepaired model, for the self-check/sweeps.
+            ds (Dataset): Supplies columns/feature_bounds/X_train/categorical_levels.
+            spec (Spec): Dataset spec.
+            bins (FrozenBins): Frozen plausibility bins.
+            structure (TreeStructure): Pre-extracted tree structure.
+            flip_set (tuple[str, ...]): Features x1/x2 are allowed to differ on.
+            direction (str): `"protected"` or `"monotone_wrong"`.
+            v: The repaired leaf values.
+            cuts (list[Cut]): Accumulated cuts, for the region-overlap check.
+            settings (Settings): Every hyperparameter for this run.
+            plotter (ResultsPlotter): Where to save the sweep plots.
+            stage_label (str): This stage's label, for plot filenames.
+
+        Returns:
+            dict: Held-out verification, self-check, and sweep results, to
+                merge into the run's payload.
+        """
+
+        payload: dict = {}
+        leaf_map = LeafMap(booster)
         log.info("--- held-out verification (Ensense core) ---")
+
+        assert ds.columns is not None and ds.feature_bounds is not None
+
         hv: HeldoutResult = HeldoutVerifier.verify(
             repaired_booster,
             ds.columns,
-            (feature,),
-            details_csv=str(details_csv) if details_csv.exists() else None,
-            output_gap=(settings.sensitivity.gap, 1.0 - settings.sensitivity.gap),
-            timeout=int(settings.oracle.time_limit_s),
+            flip_set,
+            spec,
+            bins,
+            ds.feature_bounds,
+            settings,
         )
         payload["heldout_verify"] = {"generalized": hv.generalized, "note": hv.note}
 
         if hv.fresh_pair is not None:
             payload["heldout_verify"]["fresh_gap"] = hv.fresh_pair.gap
-
-        if hv.fresh_pair is not None:
-            rate: float = RegionOverlapAnalyzer.overlap_rate(
-                booster, leaf_map, [hv.fresh_pair], ds.columns, snapshot.cuts
+            rate: float = Metrics.overlap_rate(
+                booster, leaf_map, [hv.fresh_pair], ds.columns, cuts
             )
             payload["region_overlap_rate"] = rate
             log.info("region overlap rate: %.2f", rate)
 
-        log.info("--- Tier A self-check at the repaired v ---")
-        tier_a_pair: Pair | None = TierAOracle().worst_valid_pair(
+        log.info("--- sensei oracle self-check at the repaired v ---")
+        # mip_gap forced to 0 for the self-check -- it should confirm the
+        # loop's own feasibility result at the TRUE tolerance, not the
+        # looser intermediate-round `settings.oracle.mip_gap`.
+        self_check_settings: Settings = dataclasses.replace(
+            settings, oracle=dataclasses.replace(settings.oracle, mip_gap=0.0)
+        )
+        sensei_pair: Pair | None = SenseiOracle().worst_valid_pair(
             booster,
             leaf_map,
             ds.columns,
             ds.feature_bounds,
             spec,
-            (feature,),
+            flip_set,
             direction,
             mode="feasibility",
-            eps=settings.sensitivity.eps,
-            seed=settings.seeds.model_train,
-            time_limit_s=settings.oracle.time_limit_s,
-            mip_gap=0.0,
+            settings=self_check_settings,
             enforce_validity=True,
             structure=structure,
-            v=snapshot.v,
+            v=v,
             bins=bins,
-            theta=settings.sensitivity.theta,
         )
-        payload["tier_a_vs_tier_b"] = {
-            "tier_a_unsat": tier_a_pair is None,
-            "tier_b_unsat": hv.generalized,
+        payload["sensei_vs_ensense"] = {
+            "sensei_unsat": sensei_pair is None,
+            "ensense_unsat": hv.generalized,
             "note": (
-                "Tier A UNSAT means absence within our Q1+Q2-encoded domain; Tier B "
-                "UNSAT means absence under Ensense core's own search, which does not "
-                "enforce our declared validity/plausibility rules inside its search at "
-                "all."
+                "Sensei-oracle UNSAT means absence within our Q1+Q2-encoded domain; "
+                "Ensense-oracle UNSAT means absence under Ensense core's own search, "
+                "which does not enforce our declared validity/plausibility rules "
+                "inside its search at all."
             ),
         }
 
@@ -223,14 +326,11 @@ class CertifyPipeline:
             ds.feature_bounds,
             spec,
             bins,
-            (feature,),
+            flip_set,
             direction,
-            eps=settings.sensitivity.eps,
             thetas=thetas,
-            seed=settings.seeds.model_train,
-            time_limit_s=settings.oracle.time_limit_s,
-            mip_gap=settings.oracle.mip_gap,
-            v=snapshot.v,
+            settings=settings,
+            v=v,
             structure=structure,
         )
         payload["theta_sweep"] = [
@@ -253,14 +353,11 @@ class CertifyPipeline:
             ds.feature_bounds,
             spec,
             bins,
-            (feature,),
+            flip_set,
             direction,
-            theta=settings.sensitivity.theta,
             epsilons=epsilons,
-            seed=settings.seeds.model_train,
-            time_limit_s=settings.oracle.time_limit_s,
-            mip_gap=settings.oracle.mip_gap,
-            v=snapshot.v,
+            settings=settings,
+            v=v,
             structure=structure,
         )
         payload["eps_sweep"] = [
@@ -270,14 +367,119 @@ class CertifyPipeline:
         for p in eps_points:
             log.info("  eps=%-6.2f certified=%s gap=%s", p.value, p.certified, p.gap)
 
+        safe_label: str = _safe_filename(stage_label)
+        try:
+            theta_path: Path = plotter.theta_sweep(
+                theta_points, name=f"theta_sweep__{safe_label}"
+            )
+            eps_path: Path = plotter.eps_sweep(
+                eps_points, name=f"eps_sweep__{safe_label}"
+            )
+            payload["theta_sweep_plot"] = str(theta_path)
+            payload["eps_sweep_plot"] = str(eps_path)
+        except Exception:
+            log.warning(
+                "failed to plot theta/eps sweep for %s -- continuing without it",
+                stage_label,
+                exc_info=True,
+            )
+
         return payload
+
+    def _plot_hyperparams(self, settings: Settings) -> dict[str, object]:
+        """
+        The run-identifying settings stamped as a caption on every plot this
+        run produces (see `ResultsPlotter.__init__`), read off one
+        `Settings` object for the whole run.
+
+        Args:
+            settings (Settings): Every hyperparameter for this run.
+
+        Returns:
+            dict[str, object]: The subset to caption plots with.
+        """
+
+        return {
+            "n_estimators": settings.model.n_estimators,
+            "max_depth": settings.model.max_depth,
+            "eps": settings.sensitivity.eps,
+            "theta": settings.sensitivity.theta,
+            "oracle_type": settings.oracle.type,
+        }
+
+    def _plot_training_history(
+        self, plotter: ResultsPlotter, history: list[Snapshot], suffix: str = ""
+    ) -> list[Path]:
+        """
+        Save the standard set of per-iteration training plots (accuracy,
+        sensitivity rate, worst gap, slack mass, cut count vs. iteration,
+        the Pareto curve, and the combined dashboard) from ONE stage's own
+        snapshot history. `worst_gap`/the Pareto curve are only meaningful
+        within a single flip_set/direction's own iterations.
+
+        Never raises: a plotting failure is logged as a warning and the
+        certify/repair result is still returned -- a missing diagnostic
+        plot must not take down an otherwise-successful run.
+
+        `suffix` disambiguates per-stage plots saved into the same
+        `plotter.run_dir` (e.g. `"protected_single_sex"`) -- default ""
+        for the single-flip-set `run()` case, one stage per plotter.
+
+        Args:
+            plotter (ResultsPlotter): Where to save the plots.
+            history (list[Snapshot]): One stage's per-iteration snapshots.
+            suffix (str): Disambiguates per-stage plot filenames.
+
+        Returns:
+            list[Path]: The plots actually produced, empty on any failure
+                or if `history` has fewer than 2 snapshots.
+        """
+
+        if len(history) < 2:
+            log.warning(
+                "training history has only %d snapshot(s) -- skipping per-iteration "
+                "plots (nothing to show a trend over)",
+                len(history),
+            )
+            return []
+
+        tag: str = f"__{suffix}" if suffix else ""
+
+        try:
+            paths: list[Path] = [
+                plotter.accuracy_vs_iteration(
+                    history, name=f"accuracy_vs_iteration{tag}"
+                ),
+                plotter.sensitivity_vs_iteration(
+                    history, name=f"sensitivity_vs_iteration{tag}"
+                ),
+                plotter.worst_gap_vs_iteration(
+                    history, name=f"worst_gap_vs_iteration{tag}"
+                ),
+                plotter.slack_mass_vs_iteration(
+                    history, name=f"slack_mass_vs_iteration{tag}"
+                ),
+                plotter.cuts_vs_iteration(history, name=f"cuts_vs_iteration{tag}"),
+                plotter.pareto_curve(history, name=f"pareto_curve{tag}"),
+                plotter.training_dashboard(history, name=f"training_dashboard{tag}"),
+            ]
+        except Exception:
+            log.warning(
+                "failed to plot training history%s -- continuing without it",
+                f" for {suffix}" if suffix else "",
+                exc_info=True,
+            )
+            return []
+
+        log.info("wrote %d training plot(s) to %s", len(paths), plotter.run_dir)
+        return paths
 
     def _git_sha(self) -> str:
         """
-        Get the current Git SHA of the repository.
+        Current git HEAD SHA, or "unknown" if it can't be determined.
 
         Returns:
-            str: The current Git SHA, or "unknown" if it cannot be determined.
+            str: The current git HEAD SHA, or `"unknown"`.
         """
 
         try:

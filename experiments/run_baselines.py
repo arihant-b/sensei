@@ -1,21 +1,24 @@
 import argparse
-import json
+import logging
 import subprocess
 import time
 from pathlib import Path
 from typing import Any
 
 from sensei.config import Settings, ensense_pin, load_defaults
+from sensei.data.bins import FrozenBins
 from sensei.data.loader import Dataset
-from sensei.eval.baselines import BaselineResult, Baselines
 from sensei.eval.metrics import Metrics
+from sensei.eval.plots import ResultsPlotter
+from sensei.eval.results_writer import ResultsWriter
+from sensei.logging_setup import setup_logging
+from sensei.model.baselines import BaselineResult, Baselines
 from sensei.model.leaves import LeafMap
-from sensei.oracle.ensense_adapter import TierBOracle
-from sensei.oracle.types import Pair
+from sensei.oracle.ensense.adapter import EnsenseOracle
+from sensei.oracle.types import OracleDegenerate, OracleSaturated, Pair
 from sensei.spec import Spec, load_spec
 
-_RESULTS_DIR: Path = Path(__file__).resolve().parents[1] / "results"
-_DATASET_ROOT: Path = Path(__file__).resolve().parents[1] / "dataset"
+log: logging.Logger = logging.getLogger("sensei.experiments.run_baselines")
 
 
 def _git_sha() -> str:
@@ -38,23 +41,20 @@ def run(dataset: str) -> dict:
     ds: Dataset = Dataset(
         dataset,
         eval_holdout=settings.dataset.eval_holdout,
-        seed=settings.seeds.data_split,
+        seed=settings.seed,
     ).load()
 
     assert ds.X_train is not None and ds.y_train is not None
+    assert ds.columns is not None and ds.feature_bounds is not None
 
     n_estimators, max_depth = settings.model.n_estimators, settings.model.max_depth
     result: dict[str, Any] = {
         "git_sha": _git_sha(),
         "ensense_pin": ensense_pin(),
-        "stage": "stage0_baselines",
         "dataset": dataset,
         "spec_hash": spec.spec_hash,
         "metrics_version": Metrics.VERSION,
-        "seeds": {
-            "data_split": settings.seeds.data_split,
-            "model_train": settings.seeds.model_train,
-        },
+        "seed": settings.seed,
         "baselines": {},
     }
 
@@ -72,7 +72,7 @@ def run(dataset: str) -> dict:
             leaf_map,
             ds.X_test[columns],
             protected_in_cols,
-            seed=settings.seeds.model_train,
+            seed=settings.seed,
         )
         entry: dict[str, float | str] = {"accuracy": acc, "sensitivity_rate": sens}
 
@@ -80,13 +80,13 @@ def run(dataset: str) -> dict:
             entry["policy"] = policy
 
         result["baselines"][name] = entry
-        print(
+        log.info(
             f"{name:28s} acc={acc:.4f} sens={sens:.4f}"
             + (f" policy={policy}" if policy else "")
         )
 
     plain: BaselineResult = Baselines.fit_plain(
-        ds.X_train, ds.y_train, n_estimators, max_depth, settings.seeds.model_train
+        ds.X_train, ds.y_train, n_estimators, max_depth, settings.seed
     )
     _record("1_plain", plain.booster, plain.columns)
 
@@ -97,11 +97,13 @@ def run(dataset: str) -> dict:
             spec,
             n_estimators,
             max_depth,
-            settings.seeds.model_train,
+            settings.seed,
         )
         _record("2_protected_dropped", dropped.booster, dropped.columns)
     else:
-        print("2_protected_dropped: skipped, spec.protected is empty for this dataset")
+        log.info(
+            "2_protected_dropped: skipped, spec.protected is empty for this dataset"
+        )
 
     if spec.monotone:
         monotone = Baselines.fit_monotone(
@@ -110,38 +112,56 @@ def run(dataset: str) -> dict:
             spec,
             n_estimators,
             max_depth,
-            settings.seeds.model_train,
+            settings.seed,
         )
         _record("3_monotone_constraints", monotone.booster, monotone.columns)
     else:
-        print(
+        log.info(
             "3_monotone_constraints: skipped, spec.monotone is empty for this dataset"
         )
 
     if spec.protected:
         m0_leaf_map = LeafMap(plain.booster)
-        details_csv: Path = _DATASET_ROOT / dataset / "details.csv"
+        bins: FrozenBins = FrozenBins.fit_or_load(
+            dataset,
+            settings.seed,
+            settings.bins.n_quantile_bins,
+            ds.X_train,
+            ds.columns,
+            ds.categorical_levels,
+        )
         pairs: list[Pair] = []
         t0: float = time.perf_counter()
 
         for feature in spec.protected:
-            pair: Pair | None = TierBOracle().worst_valid_pair(
-                plain.booster,
-                m0_leaf_map,
-                plain.columns,
-                (feature,),
-                method="pb",
-                details_csv=str(details_csv) if details_csv.exists() else None,
-                output_gap=(settings.sensitivity.gap, 1.0 - settings.sensitivity.gap),
-                timeout=int(settings.oracle.time_limit_s),
-            )
+            try:
+                pair: Pair | None = EnsenseOracle().worst_valid_pair(
+                    plain.booster,
+                    m0_leaf_map,
+                    plain.columns,
+                    (feature,),
+                    spec,
+                    bins,
+                    ds.feature_bounds,
+                    settings,
+                )
+            except (OracleDegenerate, OracleSaturated) as e:
+                log.info(
+                    f"baseline 4: ensense oracle rejected/saturated for '{feature}', "
+                    f"not used for retraining ({e})"
+                )
+                continue
+
             if pair is not None:
                 pairs.append(pair)
 
         elapsed: float = time.perf_counter() - t0
         result["baseline4_pair_search_seconds"] = elapsed
         result["baseline4_pairs_found"] = len(pairs)
-        print(f"baseline 4: found {len(pairs)} pair(s) via Tier B in {elapsed:.1f}s")
+        log.info(
+            f"baseline 4: found {len(pairs)} pair(s) via the ensense oracle in "
+            f"{elapsed:.1f}s"
+        )
 
         if pairs:
             for policy in ("P1", "P2"):
@@ -156,7 +176,7 @@ def run(dataset: str) -> dict:
                     policy=policy,
                     n_estimators=n_estimators,
                     max_depth=max_depth,
-                    seed=settings.seeds.baseline4_retrain,
+                    seed=settings.seed,
                 )
                 _record(
                     f"4_counterexample_retrained_{policy}",
@@ -165,28 +185,34 @@ def run(dataset: str) -> dict:
                     policy,
                 )
         else:
-            print(
-                "4_counterexample_retrained: no pairs found (Tier B returned None for "
-                "every protected feature -- per docs/ensense_interface.md this could be"
-                " a genuine 'insensitive at this gap' result OR an unlabeled timeout; "
+            log.info(
+                "4_counterexample_retrained: no pairs found (the ensense oracle "
+                "returned None for every protected feature -- this could be a "
+                "genuine 'insensitive at this gap' result OR an unlabeled timeout; "
                 "not distinguishable as shipped). Skipped, not faked."
             )
     else:
-        print(
+        log.info(
             "4_counterexample_retrained: skipped, spec.protected is empty for this "
             "dataset"
         )
 
-    _RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    out_path: Path = (
-        _RESULTS_DIR / f"stage0_baselines_{dataset}_{int(time.time())}.json"
-    )
-    out_path.write_text(json.dumps(result, indent=2))
-    print(f"wrote {out_path}")
+    plotter = ResultsPlotter(label=f"{dataset}_baselines")
+    result["plots_dir"] = str(plotter.run_dir)
+
+    try:
+        plot_path: Path = plotter.baseline_comparison(result["baselines"])
+        result["baseline_comparison_plot"] = str(plot_path)
+    except Exception:
+        log.warning("failed to plot baseline comparison -- continuing without it",
+                     exc_info=True)
+
+    ResultsWriter.write(result, f"baselines_{dataset}")
     return result
 
 
 def main() -> None:
+    setup_logging("run_baselines")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", required=True)
     args = parser.parse_args()

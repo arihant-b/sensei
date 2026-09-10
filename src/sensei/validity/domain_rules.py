@@ -1,35 +1,28 @@
-from sensei.data.bins import Point
+from sensei.data.bins import EncodedSample
 from sensei.spec import DomainRule, Spec
+from sensei.validity.pairwise import pair_check, pair_reason
 
 _TOL = 1e-9
 
 
 class DomainRuleChecker:
-    """
-    A utility class for checking whether a given point satisfies the domain rules
-    specified in a dataset specification.
-
-    Raises:
-        ValueError: If an unknown sense is encountered in a domain rule.
-    """
+    """Checks a point against `spec.domain_rules` (linear inequalities/equalities)."""
 
     @staticmethod
-    def check_rule(x: Point, rule: DomainRule, tol: float = _TOL) -> bool:
+    def check_rule(x: EncodedSample, rule: DomainRule, tol: float = _TOL) -> bool:
         """
-        Check if a point satisfies a single domain rule.
+        `x` satisfies the single linear constraint `rule` (within `tol`).
 
         Args:
-            x (Point): The point to check, represented as a dictionary mapping feature
-                       names to values.
-            rule (DomainRule): The domain rule to check against.
-            tol (float, optional): The tolerance for floating-point comparisons.
-                                   Defaults to _TOL.
-
-        Raises:
-            ValueError: If an unknown sense is encountered in a domain rule.
+            x (EncodedSample): The point to check.
+            rule (DomainRule): The linear constraint to check against.
+            tol (float): Numerical tolerance.
 
         Returns:
-            bool: True if the point satisfies the domain rule, False otherwise.
+            bool: True iff `x` satisfies `rule`.
+
+        Raises:
+            ValueError: `rule.sense` isn't one of "<=", ">=", "==".
         """
 
         # rule doesn't apply to this point's feature set
@@ -48,18 +41,103 @@ class DomainRuleChecker:
         raise ValueError(f"unknown domain rule sense: {rule.sense!r}")
 
     @staticmethod
-    def check_domain_rules(x: Point, spec: Spec) -> bool:
+    def rule_reason(
+        x: EncodedSample, rule: DomainRule, tol: float = _TOL
+    ) -> str | None:
         """
-        Check if a point satisfies all domain rules specified in the dataset
-        specification.
+        Diagnostic form of `check_rule`: a human-readable description of the
+        violated linear constraint -- its coefficients, sense, declared RHS,
+        and the point's actual LHS value -- or None if `x` satisfies `rule`.
 
         Args:
-            x (Point): The point to check, represented as a dictionary mapping feature
-                       names to values.
-            spec (Spec): The dataset specification containing the domain rules.
+            x (EncodedSample): The point to check.
+            rule (DomainRule): The linear constraint to check against.
+            tol (float): Numerical tolerance.
 
         Returns:
-            bool: True if the point satisfies all domain rules, False otherwise.
+            str | None: The violation description, or None if `x`
+                satisfies `rule`.
+
+        Raises:
+            ValueError: `rule.sense` isn't one of "<=", ">=", "==".
+        """
+
+        if not all(f in x for f in rule.coefficients):
+            return None
+
+        lhs: float = sum(coef * float(x[f]) for f, coef in rule.coefficients.items())
+
+        if rule.sense == "<=":
+            satisfied = lhs <= rule.rhs + tol
+        elif rule.sense == ">=":
+            satisfied = lhs >= rule.rhs - tol
+        elif rule.sense == "==":
+            satisfied = abs(lhs - rule.rhs) <= tol
+        else:
+            raise ValueError(f"unknown domain rule sense: {rule.sense!r}")
+
+        if satisfied:
+            return None
+
+        expr: str = " + ".join(
+            f"{coef:g}*{feature}" for feature, coef in rule.coefficients.items()
+        )
+        return f"{expr} {rule.sense} {rule.rhs:g} violated (lhs={lhs:g})"
+
+    @staticmethod
+    def domain_rule_reason(x: EncodedSample, spec: Spec) -> str | None:
+        """
+        Diagnostic form of `check_domain_rules`: the first violated rule's
+        reason, or None if `x` satisfies every declared domain rule.
+
+        Args:
+            x (EncodedSample): The point to check.
+            spec (Spec): Declares `domain_rules`.
+
+        Returns:
+            str | None: The first violation's reason, or None.
+        """
+
+        for rule in spec.domain_rules:
+            reason: str | None = DomainRuleChecker.rule_reason(x, rule)
+            if reason is not None:
+                return reason
+
+        return None
+
+    @staticmethod
+    def domain_rule_pair_reason(
+        x1: EncodedSample, x2: EncodedSample, spec: Spec
+    ) -> str | None:
+        """
+        Diagnostic form of `check_domain_rules_pair`: the first violated
+        rule's reason, prefixed with which point it came from
+        (`"x1."`/`"x2."`), or None if the pair satisfies every declared
+        domain rule.
+
+        Args:
+            x1 (EncodedSample): The first point.
+            x2 (EncodedSample): The second point.
+            spec (Spec): Declares `domain_rules`.
+
+        Returns:
+            str | None: The first violation's reason, prefixed with
+                `"x1."`/`"x2."`, or None.
+        """
+
+        return pair_reason(DomainRuleChecker.domain_rule_reason, x1, x2, spec)
+
+    @staticmethod
+    def check_domain_rules(x: EncodedSample, spec: Spec) -> bool:
+        """
+        `x` satisfies every declared domain rule in `spec`.
+
+        Args:
+            x (EncodedSample): The point to check.
+            spec (Spec): Declares `domain_rules`.
+
+        Returns:
+            bool: True iff `x` satisfies every rule.
         """
 
         return all(
@@ -71,22 +149,19 @@ class DomainRuleChecker:
         )
 
     @staticmethod
-    def check_domain_rules_pair(x1: Point, x2: Point, spec: Spec) -> bool:
+    def check_domain_rules_pair(
+        x1: EncodedSample, x2: EncodedSample, spec: Spec
+    ) -> bool:
         """
-        Check if a pair of points satisfies all domain rules specified in the dataset
-        specification.
+        Both `x1` and `x2` independently satisfy `check_domain_rules`.
 
         Args:
-            x1 (Point): The first point to check, represented as a dictionary mapping
-                        feature names to values.
-            x2 (Point): The second point to check, represented as a dictionary mapping
-                        feature names to values.
-            spec (Spec): The dataset specification containing the domain rules.
+            x1 (EncodedSample): The first point.
+            x2 (EncodedSample): The second point.
+            spec (Spec): Declares `domain_rules`.
 
         Returns:
-            bool: True if both points satisfy all domain rules, False otherwise.
+            bool: True iff both points satisfy every rule.
         """
 
-        return DomainRuleChecker.check_domain_rules(
-            x1, spec
-        ) and DomainRuleChecker.check_domain_rules(x2, spec)
+        return pair_check(DomainRuleChecker.check_domain_rules, x1, x2, spec)

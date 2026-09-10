@@ -6,15 +6,61 @@ monotone:
   hours-per-week: increasing
 immutable: [native-country]
 
+# Every ordinal-encoded categorical (workclass, education, marital-status,
+# occupation, relationship, race, sex, native-country) is included here too,
+# alongside the genuinely-numeric integer features -- data/builder.py encodes
+# each one as a raw ordinal index (0, 1, 2, ...), so by construction its raw
+# value is always an integer. Omitting them let the MILP (and the postfilter)
+# select fractional category codes that don't correspond to any real category
+# -- confirmed empirically: without this, is_type_valid_pair accepted a
+# solver-returned point with sex=0.3 as valid.
 integer_features:
-  [age, education-num, hours-per-week, capital-gain, capital-loss]
+  [
+    age,
+    education-num,
+    hours-per-week,
+    capital-gain,
+    capital-loss,
+    workclass,
+    education,
+    marital-status,
+    occupation,
+    relationship,
+    race,
+    sex,
+    native-country,
+  ]
 one_hot_groups: {}
+# lb/ub per feature, taken verbatim from dataset/adult/details.csv (built by
+# data/builder.py from D_train, min-max-scaled [0,1] space -- see README's
+# note that ranges/functional_deps values live in that space, not raw
+# units). This is the SAME details.csv path handed to Ensense core as its
+# own search bounds (oracle/ensense/adapter.py's details_csv param), so this
+# section and Ensense's own domain are drawn from one source of truth.
 ranges:
   age: [0.0, 1.0]
-  hours-per-week: [0.0, 1.0]
-functional_deps:
-  - [education, 0.6666666666666666, education-num, 1.0]
+  workclass: [0.0, 1.0]
+  fnlwgt: [0.0, 1.0]
+  education: [0.0, 1.0]
+  education-num: [0.0, 1.0]
+  marital-status: [0.0, 1.0]
+  occupation: [0.0, 0.9999999999999999]
+  relationship: [0.0, 1.0]
+  race: [0.0, 1.0]
+  sex: [0.0, 1.0]
+  capital-gain: [0.0, 1.0]
+  capital-loss: [0.0, 1.0]
+  hours-per-week: [0.0, 0.9999999999999999]
+  native-country: [0.0, 1.0]
+functional_deps: []
 
-preprocessing:
-  drop_fd_redundant_columns: [] # candidate: drop 'education', keep 'education-num'
-  integer_code_features: [] # candidate: same list as integer_features above
+# NOTE on missing values (workclass, occupation, native-country -- the three
+# UCI Adult columns with '?'): data/builder.py::_encode_categoricals encodes
+# them as raw ordinal code -1 unconditionally, rather than dropping the row
+# or giving them their own category, matching Ensense core's own encoding
+# exactly (ensense/src/read_output.py::compute_scaling_func:
+# `.map(index_of).fillna(-1)`), confirmed empirically against Ensense's
+# bundled adult scaler.pkl (data_min_ == -1.0 for exactly these three
+# columns). This means -1 is a legitimate, representable value for those
+# three features -- a search over the domain can propose "unknown
+# workclass" as part of a counterexample.

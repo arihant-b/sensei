@@ -1,12 +1,21 @@
+import dataclasses
 from dataclasses import dataclass
 
 import xgboost as xgb
 
+from sensei.config import Settings
 from sensei.data.bins import FrozenBins
 from sensei.model.leaves import LeafMap
-from sensei.oracle.milp.encoding import TreeEncoder, TreeStructure
-from sensei.oracle.milp.solve import TierAOracle
-from sensei.oracle.types import OracleTimeout
+from sensei.oracle.ensense.adapter import EnsenseOracle
+from sensei.oracle.sensei.encoding import TreeEncoder
+from sensei.oracle.sensei.solve import SenseiOracle
+from sensei.oracle.types import (
+    OracleDegenerate,
+    OracleSaturated,
+    OracleTimeout,
+    Pair,
+    TreeStructure,
+)
 from sensei.spec import Spec
 
 
@@ -14,13 +23,14 @@ from sensei.spec import Spec
 class SweepPoint:
     """
     A single point in a sweep, representing the result of a feasibility check at a
-    specific value of theta or eps.
+    specific value of theta, eps, mip_gap, or the ensense oracle's output_gap.
     """
 
-    value: float  # the theta or eps swept
+    value: float  # the swept parameter's value
     certified: bool  # True iff the oracle found no valid pair (UNSAT)
     gap: float | None  # the found violation's gap, if any
-    status: str  # "UNSAT" | "SAT" | "TIMEOUT"
+    status: str  # "UNSAT" | "SAT" | "TIMEOUT" | "ORACLE_SATURATED"
+    # ORACLE_SATURATED is EnsenseOracle only
 
 
 class Sweeper:
@@ -37,40 +47,37 @@ class Sweeper:
         bins: FrozenBins,
         flip_set: tuple[str, ...],
         direction: str,
-        eps: float,
         thetas: list[float],
-        seed: int,
-        time_limit_s: float,
-        mip_gap: float,
+        settings: Settings,
         v=None,
         structure: TreeStructure | None = None,
     ) -> list[SweepPoint]:
         """
-        Sweep over theta, reporting the result of a feasibility check at each value.
+        The required theta curve: re-run the sensei oracle's feasibility
+        check at each `thetas` value, fixed `settings.sensitivity.eps`, on
+        the same (optionally repaired via `v`) booster. Raising theta
+        shrinks the plausible region, so this is never reported as a single
+        number.
 
         Args:
-            booster (xgb.Booster): The XGBoost booster to evaluate.
-            columns (list[str]): The list of column names in the dataset.
-            feature_bounds (dict[str, tuple[float, float]]): The bounds for each
-                                                             feature.
-            spec (Spec): The specification to check.
-            bins (FrozenBins): The bins to use for the evaluation.
-            flip_set (tuple[str, ...]): The set of features to flip.
-            direction (str): The direction of the flip.
-            eps (float): The epsilon value to use for the feasibility check.
-            thetas (list[float]): The list of theta values to sweep over.
-            seed (int): The random seed to use for the evaluation.
-            time_limit_s (float): The time limit for the evaluation in seconds.
-            mip_gap (float): The MIP gap to use for the evaluation.
-            v (_type_, optional): The vector of values to use for the evaluation.
-                                  Defaults to None.
-            structure (TreeStructure | None, optional): The tree structure to use for
-                                                        the evaluation. Defaults to
-                                                        None.
+            booster (xgb.Booster): The (optionally repaired) model to check.
+            columns (list[str]): All feature names, in model column order.
+            feature_bounds (dict[str, tuple[float, float]]): Raw `(lo, hi)`
+                bounds per feature.
+            spec (Spec): Dataset spec, for validity/plausibility encoding.
+            bins (FrozenBins): Frozen plausibility bins.
+            flip_set (tuple[str, ...]): Features x1/x2 are allowed to differ on.
+            direction (str): `"protected"` or `"monotone_wrong"`.
+            thetas (list[float]): Plausibility thresholds to sweep.
+            settings (Settings): Base settings; `sensitivity.theta` is
+                overridden per point.
+            v (NDArray[np.float64] | None): Leaf values to check with;
+                `leaf_map.v0` if None.
+            structure (TreeStructure | None): Pre-extracted tree structure;
+                extracted fresh if None.
 
         Returns:
-            list[SweepPoint]: The list of sweep points representing the result of the
-                              feasibility check at each theta value.
+            list[SweepPoint]: One point per `thetas` value.
         """
 
         leaf_map = LeafMap(booster)
@@ -80,12 +87,16 @@ class Sweeper:
                 booster, leaf_map.leaf_index, columns
             )
 
-        oracle = TierAOracle()
+        oracle = SenseiOracle()
         points: list[SweepPoint] = []
 
         for theta in thetas:
+            point_settings: Settings = dataclasses.replace(
+                settings,
+                sensitivity=dataclasses.replace(settings.sensitivity, theta=theta),
+            )
             try:
-                pair = oracle.worst_valid_pair(
+                pair: Pair | None = oracle.worst_valid_pair(
                     booster,
                     leaf_map,
                     columns,
@@ -94,15 +105,11 @@ class Sweeper:
                     flip_set,
                     direction,
                     mode="feasibility",
-                    eps=eps,
-                    seed=seed,
-                    time_limit_s=time_limit_s,
-                    mip_gap=mip_gap,
+                    settings=point_settings,
                     enforce_validity=True,
                     structure=structure,
                     v=v,
                     bins=bins,
-                    theta=theta,
                 )
             except OracleTimeout:
                 points.append(
@@ -130,40 +137,34 @@ class Sweeper:
         bins: FrozenBins,
         flip_set: tuple[str, ...],
         direction: str,
-        theta: float,
         epsilons: list[float],
-        seed: int,
-        time_limit_s: float,
-        mip_gap: float,
+        settings: Settings,
         v=None,
         structure: TreeStructure | None = None,
     ) -> list[SweepPoint]:
         """
-        Sweep over eps, reporting the result of a feasibility check at each value.
+        Same shape as `theta_sweep`, but sweeps `epsilons` at a fixed
+        `settings.sensitivity.theta`.
 
         Args:
-            booster (xgb.Booster): The XGBoost booster to evaluate.
-            columns (list[str]): The list of column names.
-            feature_bounds (dict[str, tuple[float, float]]): The bounds for each
-                                                             feature.
-            spec (Spec): The specification to check.
-            bins (FrozenBins): The bins to use for the evaluation.
-            flip_set (tuple[str, ...]): The set of features to flip.
-            direction (str): The direction of the sweep.
-            theta (float): The threshold value.
-            epsilons (list[float]): The list of epsilon values to sweep over.
-            seed (int): The random seed to use.
-            time_limit_s (float): The time limit for each evaluation in seconds.
-            mip_gap (float): The MIP gap to use for the optimization.
-            v (_type_, optional): The vector of values to use for the evaluation.
-                                  Defaults to None.
-            structure (TreeStructure | None, optional): The tree structure to use for
-                                                        the evaluation. Defaults to
-                                                        None.
+            booster (xgb.Booster): The (optionally repaired) model to check.
+            columns (list[str]): All feature names, in model column order.
+            feature_bounds (dict[str, tuple[float, float]]): Raw `(lo, hi)`
+                bounds per feature.
+            spec (Spec): Dataset spec, for validity/plausibility encoding.
+            bins (FrozenBins): Frozen plausibility bins.
+            flip_set (tuple[str, ...]): Features x1/x2 are allowed to differ on.
+            direction (str): `"protected"` or `"monotone_wrong"`.
+            epsilons (list[float]): Sensitivity budgets to sweep.
+            settings (Settings): Base settings; `sensitivity.eps` is
+                overridden per point.
+            v (NDArray[np.float64] | None): Leaf values to check with;
+                `leaf_map.v0` if None.
+            structure (TreeStructure | None): Pre-extracted tree structure;
+                extracted fresh if None.
 
         Returns:
-            list[SweepPoint]: The list of sweep points representing the result of the
-                              feasibility check at each epsilon value.
+            list[SweepPoint]: One point per `epsilons` value.
         """
 
         leaf_map = LeafMap(booster)
@@ -173,10 +174,14 @@ class Sweeper:
                 booster, leaf_map.leaf_index, columns
             )
 
-        oracle = TierAOracle()
+        oracle = SenseiOracle()
         points: list[SweepPoint] = []
 
         for eps in epsilons:
+            point_settings: Settings = dataclasses.replace(
+                settings,
+                sensitivity=dataclasses.replace(settings.sensitivity, eps=eps),
+            )
             try:
                 pair = oracle.worst_valid_pair(
                     booster,
@@ -187,15 +192,11 @@ class Sweeper:
                     flip_set,
                     direction,
                     mode="feasibility",
-                    eps=eps,
-                    seed=seed,
-                    time_limit_s=time_limit_s,
-                    mip_gap=mip_gap,
+                    settings=point_settings,
                     enforce_validity=True,
                     structure=structure,
                     v=v,
                     bins=bins,
-                    theta=theta,
                 )
             except OracleTimeout:
                 points.append(
@@ -208,6 +209,182 @@ class Sweeper:
             else:
                 points.append(
                     SweepPoint(eps, certified=False, gap=pair.gap, status="SAT")
+                )
+
+        return points
+
+    @staticmethod
+    def mip_gap_sweep(
+        booster: xgb.Booster,
+        columns: list[str],
+        feature_bounds: dict[str, tuple[float, float]],
+        spec: Spec,
+        bins: FrozenBins,
+        flip_set: tuple[str, ...],
+        direction: str,
+        mip_gaps: list[float],
+        settings: Settings,
+        v=None,
+        structure: TreeStructure | None = None,
+    ) -> list[SweepPoint]:
+        """
+        Sweep over the sensei oracle's solver relative-optimality tolerance
+        (`mip_gap`), same shape as `theta_sweep`/`eps_sweep`: hold the
+        trained (and, if `v` is given, repaired) booster fixed, re-run our
+        own MILP oracle's feasibility check at each `mip_gap` (fixed
+        `settings.sensitivity.eps`/`.theta`), and report UNSAT/SAT/TIMEOUT.
+        Unlike theta/eps this isn't a modeling choice being certified
+        against -- it's solver precision -- so a point here shows whether
+        loosening the tolerance changes what the oracle reports, not a
+        property of the model itself.
+
+        Args:
+            booster (xgb.Booster): The (optionally repaired) model to check.
+            columns (list[str]): All feature names, in model column order.
+            feature_bounds (dict[str, tuple[float, float]]): Raw `(lo, hi)`
+                bounds per feature.
+            spec (Spec): Dataset spec, for validity/plausibility encoding.
+            bins (FrozenBins): Frozen plausibility bins.
+            flip_set (tuple[str, ...]): Features x1/x2 are allowed to differ on.
+            direction (str): `"protected"` or `"monotone_wrong"`.
+            mip_gaps (list[float]): Relative MIP gaps to sweep.
+            settings (Settings): Base settings; `oracle.mip_gap` is
+                overridden per point.
+            v (NDArray[np.float64] | None): Leaf values to check with;
+                `leaf_map.v0` if None.
+            structure (TreeStructure | None): Pre-extracted tree structure;
+                extracted fresh if None.
+
+        Returns:
+            list[SweepPoint]: One point per `mip_gaps` value.
+        """
+
+        leaf_map = LeafMap(booster)
+
+        if structure is None:
+            structure = TreeEncoder.extract_tree_structure(
+                booster, leaf_map.leaf_index, columns
+            )
+
+        oracle = SenseiOracle()
+        points: list[SweepPoint] = []
+
+        for mip_gap in mip_gaps:
+            point_settings: Settings = dataclasses.replace(
+                settings, oracle=dataclasses.replace(settings.oracle, mip_gap=mip_gap)
+            )
+            try:
+                pair = oracle.worst_valid_pair(
+                    booster,
+                    leaf_map,
+                    columns,
+                    feature_bounds,
+                    spec,
+                    flip_set,
+                    direction,
+                    mode="feasibility",
+                    settings=point_settings,
+                    enforce_validity=True,
+                    structure=structure,
+                    v=v,
+                    bins=bins,
+                )
+            except OracleTimeout:
+                points.append(
+                    SweepPoint(mip_gap, certified=False, gap=None, status="TIMEOUT")
+                )
+                continue
+
+            if pair is None:
+                points.append(
+                    SweepPoint(mip_gap, certified=True, gap=None, status="UNSAT")
+                )
+            else:
+                points.append(
+                    SweepPoint(mip_gap, certified=False, gap=pair.gap, status="SAT")
+                )
+
+        return points
+
+    @staticmethod
+    def gap_sweep(
+        booster: xgb.Booster,
+        columns: list[str],
+        feature_bounds: dict[str, tuple[float, float]],
+        spec: Spec,
+        bins: FrozenBins,
+        flip_set: tuple[str, ...],
+        output_gap_lowers: list[float],
+        settings: Settings,
+    ) -> list[SweepPoint]:
+        """
+        Sweep over the ensense oracle's own confident-flip margin: Ensense
+        core's `output_gap` is a symmetric `(lo, 1 - lo)` band in
+        PROBABILITY space (not the margin-space `eps`), and only a flip
+        Ensense itself is this confident about counts as a hit. Unlike
+        `theta_sweep`/`eps_sweep`/`mip_gap_sweep`, which all re-run OUR OWN
+        MILP (the sensei oracle), this calls Ensense core directly
+        (`EnsenseOracle.worst_valid_pair`) at each `lo` (via a per-point
+        `settings.sensitivity.gap` override -- `EnsenseOracle.worst_valid_pair`
+        derives its own `output_gap` from that field), on the same fixed
+        booster, using `settings.sensitivity.theta`/`settings.oracle.method`/
+        `.time_limit_s` fixed throughout -- the sensei oracle never sees
+        `output_gap` at all (CegsalLoop's ensense entry point,
+        `worst_valid_pair_loop`, doesn't expose it either).
+
+        `OracleDegenerate`/`OracleSaturated` (the ensense oracle's postfilter
+        rejection budget exhausted) is its own status, `"ORACLE_SATURATED"`
+        -- this must never be folded into `"TIMEOUT"` or `"UNSAT"`, since it
+        means something different (we ran out of rejection budget, not that
+        the oracle proved or timed out).
+
+        Args:
+            booster (xgb.Booster): The (optionally repaired) model to check.
+            columns (list[str]): All feature names, in model column order.
+            feature_bounds (dict[str, tuple[float, float]]): Raw `(lo, hi)`
+                bounds per feature.
+            spec (Spec): Dataset spec, for the Ensense postfilter.
+            bins (FrozenBins): Frozen plausibility bins.
+            flip_set (tuple[str, ...]): Features x1/x2 are allowed to differ on.
+            output_gap_lowers (list[float]): Lower bounds `lo` to sweep;
+                each point's band is `(lo, 1 - lo)`.
+            settings (Settings): Base settings; `sensitivity.gap` is
+                overridden per point.
+
+        Returns:
+            list[SweepPoint]: One point per `output_gap_lowers` value.
+        """
+
+        leaf_map = LeafMap(booster)
+        oracle = EnsenseOracle()
+        points: list[SweepPoint] = []
+
+        for lo in output_gap_lowers:
+            point_settings: Settings = dataclasses.replace(
+                settings, sensitivity=dataclasses.replace(settings.sensitivity, gap=lo)
+            )
+            try:
+                pair = oracle.worst_valid_pair(
+                    booster,
+                    leaf_map,
+                    columns,
+                    flip_set,
+                    spec,
+                    bins,
+                    feature_bounds,
+                    point_settings,
+                )
+            except (OracleDegenerate, OracleSaturated):
+                points.append(
+                    SweepPoint(lo, certified=False, gap=None, status="ORACLE_SATURATED")
+                )
+                continue
+
+            if pair is None:
+                points.append(SweepPoint(lo, certified=True, gap=None, status="UNSAT"))
+            else:
+                points.append(
+                    SweepPoint(lo, certified=False, gap=pair.gap, status="SAT")
                 )
 
         return points

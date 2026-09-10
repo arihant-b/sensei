@@ -21,23 +21,23 @@ class Cut:
 
 class CutBuilder:
     """
-    Builds sparse leaf-difference cuts from counterexample pairs. Each cut forbids the
-    joint pattern of active leaves for the two points, ensuring that at least one tree's
-    active leaf differs between the two points in future solutions.
+    Builds sparse leaf-difference cuts (repair pool only, this is NOT a
+    no-good). `d = ell1 - ell2`; shared leaves cancel, so the cut is
+    sparse over `d`'s nonzeros. Bounding `d @ v` bounds the gap for every
+    future pair sharing this same difference pattern, not just this one.
     """
 
     @staticmethod
     def make_cut(pair: Pair, eps: float) -> Cut:
         """
-        Construct a sparse leaf-difference cut from a counterexample pair.
+        `d = ell1 - ell2` as a sparse (idx, coef), plus the `eps` cut bound.
 
         Args:
-            pair (Pair): The pair of points for which to construct the cut.
-            eps (float): The epsilon value used in the cut construction.
+            pair (Pair): The counterexample pair to build a cut from.
+            eps (float): Sensitivity budget this cut should enforce.
 
         Returns:
-            Cut: The constructed sparse leaf-difference cut representing the difference
-                 between the two points.
+            Cut: The sparse leaf-difference cut.
         """
 
         set1: set[int] = {int(n) for n in pair.ell1}

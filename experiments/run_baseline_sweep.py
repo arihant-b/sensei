@@ -1,12 +1,11 @@
 import argparse
 import logging
-import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from run_stage0_baselines import run as run_stage0_baselines  # noqa: E402
+from run_baselines import run as run_baselines
 
-from sensei.spec import ALL_DATASETS  # noqa: E402
+from sensei.logging_setup import setup_logging
+from sensei.spec import ALL_DATASETS
 
 log: logging.Logger = logging.getLogger("sensei.experiments.run_baseline_sweep")
 
@@ -27,7 +26,7 @@ def run(datasets: list[str] | None = None) -> dict[str, dict]:
 
     for dataset in targets:
         log.info("=== baselines: %s ===", dataset)
-        results[dataset] = run_stage0_baselines(dataset)
+        results[dataset] = run_baselines(dataset)
 
     return results
 
@@ -37,7 +36,7 @@ def _built_datasets() -> list[str]:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    setup_logging("run_baseline_sweep")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--datasets",

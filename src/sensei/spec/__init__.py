@@ -16,16 +16,10 @@ class Direction(Enum):
 
 
 @dataclass(frozen=True)
-class Preprocessing:
-    drop_fd_redundant_columns: tuple[str, ...] = ()
-    integer_code_features: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
 class DomainRule:
     """
-    A linear inequality over the features, for type-validity (Q1) and Tier B1
-    preprocessing. The coefficients are in the feature space, not the leaf space.
+    A linear inequality over the features, for type-validity (Q1) checks. The
+    coefficients are in the feature space, not the leaf space.
     """
 
     coefficients: dict[str, float]
@@ -36,7 +30,10 @@ class DomainRule:
 @dataclass(frozen=True)
 class Spec:
     """
-    The parsed sensei/spec/<dataset>.yaml file, frozen after Stage 0.
+    One dataset's parsed spec/<dataset>.yaml: which features are protected,
+    monotone, or immutable, plus every validity rule (integer/one-hot/range,
+    functional dependency, linear domain rule) used to tell a real point
+    apart from a malformed one.
     """
 
     dataset: str
@@ -50,20 +47,20 @@ class Spec:
     functional_deps: tuple[tuple[str, float, str, float], ...]
     domain_rules: tuple[DomainRule, ...]
 
-    preprocessing: Preprocessing
-
     spec_hash: str = field(compare=False)
 
 
-def _spec_hash(raw: dict) -> str:
+def _spec_hash(raw: dict[str, Any]) -> str:
     """
-    Compute a stable hash over the raw YAML content.
+    SHA256 of the raw YAML dict, keys sorted so the hash doesn't depend on
+    field order in the file. Used to detect when a spec changed under a
+    result that was certified against the old version.
 
     Args:
-        raw (dict): The raw dictionary loaded from the YAML file.
+        raw (dict[str, Any]): The parsed YAML spec.
 
     Returns:
-        str: The SHA256 hash of the canonical JSON representation of the raw dictionary.
+        str: The hex-encoded SHA256 digest.
     """
 
     canonical = json.dumps(raw, sort_keys=True, separators=(",", ":"))
@@ -72,15 +69,14 @@ def _spec_hash(raw: dict) -> str:
 
 def load_spec(dataset: str, path: Path | str | None = None) -> Spec:
     """
-    Load a spec from a YAML file.
+    Parse spec/<dataset>.yaml (or `path`, if given) into a `Spec`.
 
     Args:
-        dataset (str): The dataset name, used to locate the spec file.
-        path (Path | str | None, optional): The path to the spec file. If None, the
-                                            default path is used. Defaults to None.
+        dataset (str): Dataset name, matching `spec/<dataset>.yaml`.
+        path (Path | str | None): Override path to parse instead.
 
     Returns:
-        Spec: The loaded spec object.
+        Spec: The parsed spec.
     """
 
     spec_path = Path(path or _SPEC_DIR / f"{dataset}.yaml")
@@ -108,8 +104,6 @@ def load_spec(dataset: str, path: Path | str | None = None) -> Spec:
         )
         for rule in raw.get("domain_rules", [])
     )
-    preprocessing_raw = raw.get("preprocessing", {})
-
     return Spec(
         dataset=raw["dataset"],
         protected=tuple(raw.get("protected", [])),
@@ -120,14 +114,6 @@ def load_spec(dataset: str, path: Path | str | None = None) -> Spec:
         ranges=ranges,
         functional_deps=functional_deps,
         domain_rules=domain_rules,
-        preprocessing=Preprocessing(
-            drop_fd_redundant_columns=tuple(
-                preprocessing_raw.get("drop_fd_redundant_columns", [])
-            ),
-            integer_code_features=tuple(
-                preprocessing_raw.get("integer_code_features", [])
-            ),
-        ),
         spec_hash=_spec_hash(raw),
     )
 

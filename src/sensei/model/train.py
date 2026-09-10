@@ -3,28 +3,27 @@ import xgboost as xgb
 
 
 class Trainer:
-    """
-    A class for training XGBoost models.
-    """
+    """Trains M0, the one XGBoost model everything else in this project starts from."""
 
     @staticmethod
     def train_baseline(
         X: pd.DataFrame, y: pd.Series, n_estimators: int, max_depth: int, seed: int
     ) -> xgb.Booster:
         """
-        Train a baseline XGBoost model on the given features and labels, and return the
-        trained booster. The structure of the booster is frozen immediately after
-        training.
+        Train a plain XGBoost classifier. This is the ONLY place `xgb.fit()`
+        (tree structure changing) is allowed to run -- everything after this
+        call treats the tree structure as frozen and only ever rewrites leaf
+        values (see `model/leaves.py::LeafMap.write_leaf_values`).
 
         Args:
-            X (pd.DataFrame): The input features for training.
-            y (pd.Series): The target labels for training.
-            n_estimators (int): The number of trees to train.
-            max_depth (int): The maximum depth of each tree.
-            seed (int): The random seed for reproducibility.
+            X (pd.DataFrame): Training features.
+            y (pd.Series): Training labels, `{0, 1}`.
+            n_estimators (int): Number of trees.
+            max_depth (int): Maximum depth per tree.
+            seed (int): Training seed.
 
         Returns:
-            xgb.Booster: The trained XGBoost booster with frozen structure.
+            xgb.Booster: The trained model, M0.
         """
 
         classifier = xgb.XGBClassifier(

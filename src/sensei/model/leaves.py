@@ -32,19 +32,18 @@ class LeafMap:
 
     def phi_for(self, booster: xgb.Booster, X: pd.DataFrame) -> sp.csr_matrix:
         """
-        Compute the leaf indicator matrix phi for a dataset X. Each row corresponds
-        to a sample in X, and each column corresponds to a global leaf index n. The
-        matrix is sparse, with a 1 indicating that the sample reaches the corresponding
-        leaf in the booster.
+        Leaf indicator matrix phi, shape (n_samples, n_leaves): row i, column
+        n is 1 iff sample i reaches leaf n, else 0 -- exactly one 1 per tree
+        per row. Depends only on the frozen tree structure, so it's computed
+        once per stage and reused against every candidate `v` (see
+        `margin_score`).
 
         Args:
-            booster (xgb.Booster): The XGBoost booster to use for leaf ID computation.
-            X (pd.DataFrame): The input features for which to compute the leaf indicator
-                              matrix.
+            booster (xgb.Booster): The model to route `X` through.
+            X (pd.DataFrame): Rows to compute leaf indicators for.
 
         Returns:
-            sp.csr_matrix: The sparse leaf indicator matrix phi of shape (n_samples,
-                           n_leaves).
+            sp.csr_matrix: The `(n_samples, n_leaves)` leaf indicator matrix.
         """
 
         leaf_ids: NDArray[np.int64] = np.atleast_2d(
@@ -66,17 +65,15 @@ class LeafMap:
         self, phi: sp.csr_matrix, v: NDArray[np.float64]
     ) -> NDArray[np.float64]:
         """
-        Compute the margin scores for a dataset given the leaf indicator matrix phi and
-        the leaf values v.
-        E_v(x) = base_score + sum_t v[leaf_of(t, x)], for every row in phi.
+        E_v(x) = base_score + phi(x) @ v, for every row in phi -- the raw
+        ensemble margin (not a probability; sigmoid only at reporting).
 
         Args:
-            phi (sp.csr_matrix): The sparse leaf indicator matrix of shape (n_samples,
-                                 n_leaves).
-            v (NDArray[np.float64]): The leaf values vector of shape (n_leaves,).
+            phi (sp.csr_matrix): Leaf indicator matrix from `phi_for`.
+            v (NDArray[np.float64]): Leaf values to score with.
 
         Returns:
-            NDArray[np.float64]: The margin scores for each sample in the dataset.
+            NDArray[np.float64]: The margin score per row.
         """
 
         leaf_scores: NDArray[np.float64] = np.asarray(phi @ v, dtype=np.float64)
@@ -86,17 +83,14 @@ class LeafMap:
         self, booster: xgb.Booster, x: pd.DataFrame
     ) -> NDArray[np.int64]:
         """
-        Compute the global leaf indices for a single row of input features x. Each
-        element in the returned array corresponds to a tree in the booster, and the
-        value is the global leaf index n that the row reaches in that tree.
+        One row's global leaf index per tree -- `ell` for a single point x.
 
         Args:
-            booster (xgb.Booster): The XGBoost booster to use for leaf ID computation.
-            x (pd.DataFrame): The input features for which to compute the global leaf
-                              indices.
+            booster (xgb.Booster): The model to route `x` through.
+            x (pd.DataFrame): A single-row DataFrame.
 
         Returns:
-            NDArray[np.int64]: The global leaf indices for the input row.
+            NDArray[np.int64]: The active global leaf index per tree.
         """
 
         raw: NDArray[np.int64] = np.atleast_2d(
@@ -110,16 +104,17 @@ class LeafMap:
         self, booster: xgb.Booster, v: NDArray[np.float64]
     ) -> xgb.Booster:
         """
-        Write leaf values v into a copy of the booster, returning a new booster with
-        the updated leaf values. The tree structure remains unchanged.
+        Dump `booster` to JSON, overwrite every leaf's value with `v`
+        (structure -- splits, thresholds, tree count -- untouched), and
+        reload as a new `Booster`. This is the only way leaf values get
+        written back: XGBoost has no in-place "set this leaf's value" API.
 
         Args:
-            booster (xgb.Booster): The XGBoost booster to copy and update with new leaf
-                                   values.
-            v (NDArray[np.float64]): The new leaf values to write into the booster.
+            booster (xgb.Booster): The model whose leaf values to overwrite.
+            v (NDArray[np.float64]): New leaf values, indexed by global leaf.
 
         Returns:
-            xgb.Booster: A new XGBoost booster with the updated leaf values.
+            xgb.Booster: A new booster with `v`'s leaf values, same structure.
         """
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -152,13 +147,12 @@ class LeafMap:
 
     def _index_leaves(self, booster: xgb.Booster) -> None:
         """
-        Build the leaf index mapping from (tree_id, node_id) to a flat global index n,
-        and store the original leaf values in v0. This mapping is built once from the
-        booster and never changes, even if the leaf values themselves are repaired.
+        Assign every (tree_id, node_id) leaf a flat global index n, in the
+        order `trees_to_dataframe()` lists them, and record their original
+        values as v0. Built once at construction; never touched again.
 
         Args:
-            booster (xgb.Booster): The XGBoost booster from which to build the leaf
-                                   index mapping.
+            booster (xgb.Booster): The model to index leaves for.
         """
 
         df: pd.DataFrame = booster.trees_to_dataframe()
@@ -176,7 +170,9 @@ class LeafMap:
 
     def _build_tree_leaf_lookup(self) -> None:
         """
-        Build a lookup table for each tree that maps node IDs to global leaf indices.
+        Per-tree array: node_id -> global leaf n (-1 where node_id isn't a leaf).
+
+        Builds `self._tree_leaf_lookup` from `self.leaf_index`.
         """
 
         by_tree: dict[int, dict[int, int]] = {}
@@ -194,17 +190,22 @@ class LeafMap:
 
     def _read_base_score(self, booster: xgb.Booster) -> float:
         """
-        Read the base score (global bias term) from the booster configuration. The base
-        score is a constant that is added to the margin scores and is required for
-        computing actual predictions and accuracy. It is not part of the leaf values and
-        does not change during repair.
+        Base score in MARGIN space: XGBoost stores it as the raw
+        `binary:logistic` probability, so this reads that value and applies
+        the inverse sigmoid (logit) to get the constant `margin_score` adds.
+        It's a fixed bias, unrelated to leaf values -- never touched by
+        repair, but required for real predictions/accuracy since it cancels
+        out of every gap (`E_v(x1) - E_v(x2)`).
 
         Args:
-            booster (xgb.Booster): The XGBoost booster from which to read the base
-                                   score.
+            booster (xgb.Booster): The model to read the base score from.
 
         Returns:
-            float: The base score (global bias term) of the booster.
+            float: The base score, in margin space.
+
+        Raises:
+            AssertionError: The booster's objective isn't `binary:logistic`
+                (the only one this inverse-link has been verified against).
         """
 
         config: dict[str, Any] = json.loads(booster.save_config())
@@ -225,16 +226,15 @@ class LeafMap:
         self, leaf_index: dict[tuple[int, int], int]
     ) -> dict[int, dict[int, int]]:
         """
-        Group the leaf indices by tree. This is used by `write_leaf_values`.
+        Regroup {(tree_id, node_id): n} as {tree_id: {node_id: n}}, for
+        `write_leaf_values`.
 
         Args:
-            leaf_index (dict[tuple[int, int], int]): The mapping from (tree_id, node_id)
-                                                     to global leaf index n.
+            leaf_index (dict[tuple[int, int], int]): `(tree_id, node_id) ->`
+                flat global leaf index map.
 
         Returns:
-            dict[int, dict[int, int]]: A dictionary where each key is a tree_id and the
-                                       value is another dictionary mapping node_id to
-                                       global leaf index n for that tree.
+            dict[int, dict[int, int]]: `tree_id -> {node_id: n}`.
         """
 
         by_tree: dict[int, dict[int, int]] = {}

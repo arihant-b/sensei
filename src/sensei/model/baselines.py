@@ -8,6 +8,7 @@ from numpy.typing import NDArray
 from scipy.sparse._csr import csr_matrix
 
 from sensei.model.leaves import LeafMap
+from sensei.model.train import Trainer
 from sensei.oracle.types import Pair
 from sensei.spec import Direction, Spec
 
@@ -26,11 +27,11 @@ class BaselineResult:
 
 class Baselines:
     """
-    Stage 0 baselines. `policy=` is required with no default for baseline 4 so it can
-    never be chosen by accident.
-
-    Raises:
-        ValueError: If an invalid policy is provided for baseline 4.
+    The four comparison models SensEI's repair is measured against: a plain
+    model, one with protected features dropped, one with monotone
+    constraints, and one retrained on Ensense counterexamples. `policy=` on
+    baseline 4 has no default, so a caller can't pick a labeling policy by
+    accident.
     """
 
     @staticmethod
@@ -38,24 +39,26 @@ class Baselines:
         X: pd.DataFrame, y: pd.Series, n_estimators: int, max_depth: int, seed: int
     ) -> BaselineResult:
         """
-        Fit a plain XGBoost classifier.
+        Baseline 1: a plain XGBoost classifier, no fairness intervention.
+        Wraps `model/train.py::Trainer.train_baseline` (M0 itself) rather
+        than retraining separately -- this is the model the other three
+        baselines and CEGSAL's own repair are all trying to improve on.
 
         Args:
-            X (pd.DataFrame): The input features.
-            y (pd.Series): The target labels.
-            n_estimators (int): The number of trees to build.
-            max_depth (int): The maximum depth of the trees.
-            seed (int): The random seed for reproducibility.
+            X (pd.DataFrame): Training features.
+            y (pd.Series): Training labels, `{0, 1}`.
+            n_estimators (int): Number of trees.
+            max_depth (int): Maximum depth per tree.
+            seed (int): Training seed.
 
         Returns:
-            BaselineResult: The result of fitting the baseline model.
+            BaselineResult: The trained plain model.
         """
 
-        classifier = xgb.XGBClassifier(
-            n_estimators=n_estimators, max_depth=max_depth, random_state=seed
+        booster: xgb.Booster = Trainer.train_baseline(
+            X, y, n_estimators, max_depth, seed
         )
-        classifier.fit(X, y)
-        return BaselineResult("plain", classifier.get_booster(), list(X.columns))
+        return BaselineResult("plain", booster, list(X.columns))
 
     @staticmethod
     def fit_dropped(
@@ -67,18 +70,20 @@ class Baselines:
         seed: int,
     ) -> BaselineResult:
         """
-        Fit an XGBoost classifier after dropping protected features.
+        Baseline 2: drop every `spec.protected` column, then train plain
+        XGBoost on what's left ("fairness through unawareness" -- proxies
+        for the dropped feature can still survive in the other columns).
 
         Args:
-            X (pd.DataFrame): The input features.
-            y (pd.Series): The target labels.
-            spec (Spec): The specification containing the protected features.
-            n_estimators (int): The number of trees to build.
-            max_depth (int): The maximum depth of the trees.
-            seed (int): The random seed for reproducibility.
+            X (pd.DataFrame): Training features.
+            y (pd.Series): Training labels, `{0, 1}`.
+            spec (Spec): Declares `protected`.
+            n_estimators (int): Number of trees.
+            max_depth (int): Maximum depth per tree.
+            seed (int): Training seed.
 
         Returns:
-            BaselineResult: The result of fitting the baseline model.
+            BaselineResult: The trained model, with `protected` columns dropped.
         """
 
         keep: list[str] = list(filter(lambda c: c not in spec.protected, X.columns))
@@ -98,19 +103,21 @@ class Baselines:
         seed: int,
     ) -> BaselineResult:
         """
-        Fit an XGBoost classifier with monotone constraints on protected features.
+        Baseline 3: train with XGBoost's native `monotone_constraints`,
+        forcing the model's response to each `spec.monotone` feature to move
+        only in its declared direction (never enforced on protected features
+        directly -- only on monotone ones).
 
         Args:
-            X (pd.DataFrame): The input features.
-            y (pd.Series): The target labels.
-            spec (Spec): The specification containing the protected features and their
-                         monotone constraints.
-            n_estimators (int): The number of trees to build.
-            max_depth (int): The maximum depth of the trees.
-            seed (int): The random seed for reproducibility.
+            X (pd.DataFrame): Training features.
+            y (pd.Series): Training labels, `{0, 1}`.
+            spec (Spec): Declares `monotone`.
+            n_estimators (int): Number of trees.
+            max_depth (int): Maximum depth per tree.
+            seed (int): Training seed.
 
         Returns:
-            BaselineResult: The result of fitting the baseline model.
+            BaselineResult: The trained model, with monotone constraints applied.
         """
 
         sign: dict[Direction, int] = {Direction.INCREASING: 1, Direction.DECREASING: -1}
@@ -140,23 +147,25 @@ class Baselines:
         m0_leaf_map: LeafMap,
     ) -> list[tuple[NDArray[np.float64], NDArray[np.float64], int]]:
         """
-        Anchor protected features to majority value in training data, then label x1/x2
-        by m0's prediction on the anchored x1.
+        Policy P1 for baseline 4: overwrite each pair's protected features
+        with their most common (`.mode()`) value in `X_train`, predict with
+        M0 on that anchored copy, threshold at 0.5, and give that single
+        label to BOTH the original `x1` and `x2` (not the anchored copy --
+        anchoring is only used to decide the label). Declared explicitly
+        because there's no ground truth for a solver-generated pair, and
+        assigning one label to both members is itself a fairness assumption.
 
         Args:
-            pairs (list[Pair]): The list of pairs to label.
-            columns (list[str]): The list of column names.
-            spec (Spec): The specification containing the protected features.
-            X_train (pd.DataFrame): The training data.
-            m0_booster (xgb.Booster): The trained XGBoost model.
-            m0_leaf_map (LeafMap): The leaf map of the trained XGBoost model.
+            pairs (list[Pair]): Counterexample pairs to label.
+            columns (list[str]): All feature names, in model column order.
+            spec (Spec): Declares `protected`.
+            X_train (pd.DataFrame): Training data, for the majority-value anchor.
+            m0_booster (xgb.Booster): M0, scored to derive the label.
+            m0_leaf_map (LeafMap): Global leaf map for `m0_booster`.
 
         Returns:
-            list[tuple[NDArray[np.float64], NDArray[np.float64], int]]: A list of tuples
-                                                                        containing the
-                                                                        original x1, x2,
-                                                                        and the assigned
-                                                                        label.
+            list[tuple[NDArray[np.float64], NDArray[np.float64], int]]: Each
+                pair's `(x1, x2, label)`.
         """
 
         majority: dict[str, Any] = {
@@ -187,21 +196,20 @@ class Baselines:
         m0_leaf_map: LeafMap,
     ) -> list[tuple[NDArray[np.float64], NDArray[np.float64], int]]:
         """
-        Label x1/x2 by averaging m0's predictions on x1 and x2, then rounding to nearest
-        integer: round(sigmoid((E(x1) + E(x2)) / 2)) for both.
+        Policy P2 for baseline 4, the robustness check against P1's
+        majority-anchoring assumption: label both x1 and x2 with
+        round(sigmoid((E(x1) + E(x2)) / 2)) -- split the difference between
+        what M0 said about each side, no anchoring.
 
         Args:
-            pairs (list[Pair]): The list of pairs to label.
-            columns (list[str]): The list of column names.
-            m0_booster (xgb.Booster): The trained XGBoost model.
-            m0_leaf_map (LeafMap): The leaf map of the trained XGBoost model.
+            pairs (list[Pair]): Counterexample pairs to label.
+            columns (list[str]): All feature names, in model column order.
+            m0_booster (xgb.Booster): M0, scored to derive the label.
+            m0_leaf_map (LeafMap): Global leaf map for `m0_booster`.
 
         Returns:
-            list[tuple[NDArray[np.float64], NDArray[np.float64], int]]: A list of tuples
-                                                                        containing the
-                                                                        original x1, x2,
-                                                                        and the assigned
-                                                                        label.
+            list[tuple[NDArray[np.float64], NDArray[np.float64], int]]: Each
+                pair's `(x1, x2, label)`.
         """
 
         labeled: list[tuple[NDArray[np.float64], NDArray[np.float64], int]] = []
@@ -233,28 +241,29 @@ class Baselines:
         seed: int,
     ) -> BaselineResult:
         """
-        Fit an XGBoost classifier after augmenting the training data with
-        counterexamples labeled by the specified policy.
+        Baseline 4, the one SensEI has to beat: label every counterexample
+        pair with `policy` ("P1" or "P2", required -- no default), add both
+        `x1` and `x2` to the training data with that label, and retrain
+        plain XGBoost on the result.
 
         Args:
-            X (pd.DataFrame): The input features.
-            y (pd.Series): The target values.
-            pairs (list[Pair]): The list of pairs to use for counterexamples.
-            columns (list[str]): The list of column names.
-            spec (Spec): The specification for the model.
-            m0_booster (xgb.Booster): The trained XGBoost model.
-            m0_leaf_map (LeafMap): The leaf map of the trained XGBoost model.
-            policy (str): The policy to use for labeling the counterexamples.
-            n_estimators (int): The number of trees to use in the XGBoost classifier.
-            max_depth (int): The maximum depth of the trees in the XGBoost classifier.
-            seed (int): The random seed to use.
-
-        Raises:
-            ValueError: If an invalid policy is provided.
+            X (pd.DataFrame): Original training features.
+            y (pd.Series): Original training labels, `{0, 1}`.
+            pairs (list[Pair]): Counterexample pairs to add to training data.
+            columns (list[str]): All feature names, in model column order.
+            spec (Spec): Declares `protected`, for policy P1's anchoring.
+            m0_booster (xgb.Booster): M0, scored to derive each pair's label.
+            m0_leaf_map (LeafMap): Global leaf map for `m0_booster`.
+            policy (str): `"P1"` or `"P2"`, required -- no default.
+            n_estimators (int): Number of trees.
+            max_depth (int): Maximum depth per tree.
+            seed (int): Training seed.
 
         Returns:
-            BaselineResult: The result of fitting the baseline model with counterexample
-                            retraining.
+            BaselineResult: The retrained model, labeled with `policy`.
+
+        Raises:
+            ValueError: `policy` is neither "P1" nor "P2".
         """
 
         if policy == "P1":
@@ -305,17 +314,18 @@ class Baselines:
         columns: list[str],
     ) -> float:
         """
-        Predict the probability for a single row using the provided booster and leaf
-        map.
+        Sigmoid of M0's margin on a single raw row -- always scores against
+        the original `v0`, never a repaired model (baselines are a
+        comparison point, not something CEGSAL touches).
 
         Args:
-            booster (xgb.Booster): The trained XGBoost model.
-            leaf_map (LeafMap): The leaf map to use for prediction.
-            row (NDArray[np.float64]): The row to predict.
-            columns (list[str]): The column names for the row.
+            booster (xgb.Booster): The model to score.
+            leaf_map (LeafMap): Global leaf map for `booster`.
+            row (NDArray[np.float64]): A single raw feature row.
+            columns (list[str]): All feature names, in model column order.
 
         Returns:
-            float: The predicted probability.
+            float: The predicted probability, in `[0, 1]`.
         """
 
         df = pd.DataFrame([row], columns=columns)

@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Callable
 
 import numpy as np
 import pandas as pd
@@ -7,11 +8,14 @@ from numpy.random import Generator
 from numpy.typing import NDArray
 from scipy.sparse._csr import csr_matrix
 
+from sensei.config import Settings
 from sensei.data.bins import FrozenBins
+from sensei.eval.region_overlap import RegionOverlapAnalyzer
 from sensei.model.leaves import LeafMap
-from sensei.oracle.milp.encoding import TreeStructure
-from sensei.oracle.milp.solve import TierAOracle
-from sensei.oracle.types import Pair
+from sensei.oracle.ensense.adapter import EnsenseOracle
+from sensei.oracle.sensei.solve import SenseiOracle
+from sensei.oracle.types import Pair, TreeStructure
+from sensei.repair.cuts import Cut
 from sensei.spec import Spec
 
 log: logging.Logger = logging.getLogger("sensei.eval.metrics")
@@ -33,19 +37,17 @@ class Metrics:
         v: NDArray[np.float64] | None = None,
     ) -> NDArray[np.int64]:
         """
-        Predict labels for a dataset using a repaired booster and its leaf map.
+        Threshold `E_v(x) > 0` (margin, not probability). `v` defaults to `v0`.
 
         Args:
-            booster (xgb.Booster): The XGBoost booster to use for prediction.
-            leaf_map (LeafMap): The leaf map corresponding to the booster.
-            X (pd.DataFrame): The input features for prediction.
-            v (NDArray[np.float64] | None, optional): The leaf values to use for
-                                                      prediction. If None, the default
-                                                      leaf values from the leaf map are
-                                                      used. Defaults to None.
+            booster (xgb.Booster): The model to score.
+            leaf_map (LeafMap): Global leaf map for `booster`.
+            X (pd.DataFrame): Rows to predict.
+            v (NDArray[np.float64] | None): Leaf values to score with;
+                `leaf_map.v0` if None.
 
         Returns:
-            NDArray[np.int64]: The predicted labels as a NumPy array of integers.
+            NDArray[np.int64]: `{0, 1}` predictions, one per row.
         """
 
         v = leaf_map.v0 if v is None else v
@@ -62,21 +64,18 @@ class Metrics:
         v: NDArray[np.float64] | None = None,
     ) -> float:
         """
-        Compute the accuracy of a repaired booster on a given dataset.
+        Fraction of `X`/`y` where `predict` matches the true label.
 
         Args:
-            booster (xgb.Booster): The XGBoost booster to evaluate.
-            leaf_map (LeafMap): The leaf map corresponding to the booster.
-            X (pd.DataFrame): The input features for evaluation.
-            y (pd.Series): The true labels for the evaluation dataset.
-            v (NDArray[np.float64] | None, optional): The leaf values to use for
-                                                      prediction. If None, the default
-                                                      leaf values from the leaf map are
-                                                      used. Defaults to None.
+            booster (xgb.Booster): The model to score.
+            leaf_map (LeafMap): Global leaf map for `booster`.
+            X (pd.DataFrame): Rows to predict.
+            y (pd.Series): True labels, `{0, 1}`.
+            v (NDArray[np.float64] | None): Leaf values to score with;
+                `leaf_map.v0` if None.
 
         Returns:
-            float: The accuracy of the booster on the evaluation dataset, computed as
-                   the fraction of correctly predicted labels.
+            float: Test accuracy on `X`/`y`.
         """
 
         preds: NDArray[np.int64] = Metrics.predict(booster, leaf_map, X, v)
@@ -93,26 +92,22 @@ class Metrics:
         seed: int = 42,
     ) -> float:
         """
-        Compute the sensitivity rate of a repaired booster on a given dataset with
-        respect to a set of protected features. The sensitivity rate is defined as the
-        fraction of rows in the dataset for which flipping any of the protected features
-        results in a change in the predicted label.
+        Sensitivity rate: fraction of `n_sample_rows` held-out rows
+        whose prediction flips when any `protected` feature is bumped to its
+        next sorted level (`_flip_next_level`).
 
         Args:
-            booster (xgb.Booster): The XGBoost booster to evaluate.
-            leaf_map (LeafMap): The leaf map corresponding to the booster.
-            X (pd.DataFrame): The input features for evaluation.
-            protected (tuple[str, ...]): The set of protected features.
-            v (NDArray[np.float64] | None, optional): The leaf values to use for
-                                                      prediction. If None, the default
-                                                      leaf values from the leaf map are
-                                                      used. Defaults to None.
-            n_sample_rows (int, optional): The number of sample rows to use for the
-                                           evaluation. Defaults to 1000.
-            seed (int, optional): The random seed to use for sampling. Defaults to 42.
+            booster (xgb.Booster): The model to score.
+            leaf_map (LeafMap): Global leaf map for `booster`.
+            X (pd.DataFrame): Held-out rows to sample from.
+            protected (tuple[str, ...]): Protected features to flip.
+            v (NDArray[np.float64] | None): Leaf values to score with;
+                `leaf_map.v0` if None.
+            n_sample_rows (int): Number of rows to sample from `X`.
+            seed (int): Sampling seed.
 
         Returns:
-            float: The sensitivity rate of the booster on the evaluation dataset.
+            float: Fraction of sampled rows whose prediction flipped.
         """
 
         if not protected or len(X) == 0:
@@ -142,45 +137,56 @@ class Metrics:
         bins: FrozenBins,
         flip_set: tuple[str, ...],
         direction: str,
-        theta: float,
-        seed: int,
-        time_limit_s: float,
-        mip_gap: float,
+        settings: Settings,
         structure: TreeStructure | None = None,
         v: NDArray[np.float64] | None = None,
     ) -> float:
         """
-        Compute the worst valid gap for a repaired booster with respect to a set of
-        flipped features. The worst valid gap is defined as the maximum difference in
-        predicted labels between the original and flipped datasets, subject to the
-        constraints defined by the dataset specification and the frozen bins.
+        Worst valid gap for reporting/sweeps: the given oracle's
+        `worst_valid_pair` in mode="optimality" (true max signed gap). NaN on
+        `EMPTY_DOMAIN` -- a misconfiguration, never a certified 0.
+
+        `settings.oracle.type="sensei"` solves to a proven-optimal worst
+        gap. `"ensense"` has no equivalent notion of "solve to optimality"
+        -- Ensense's search is a one-shot heuristic, so this reports
+        whatever single pair that search happens to return, not a proven
+        worst case. Use it only as a rough cross-check against the Sensei
+        oracle's number, never as the reported worst gap on its own.
 
         Args:
-            booster (xgb.Booster): The XGBoost booster to evaluate.
-            leaf_map (LeafMap): The leaf map for the booster.
-            columns (list[str]): The list of column names in the dataset.
-            feature_bounds (dict[str, tuple[float, float]]): The bounds for each
-                                                             feature.
-            spec (Spec): The dataset specification.
-            bins (FrozenBins): The frozen bins for the dataset.
-            flip_set (tuple[str, ...]): The set of features to flip.
-            direction (str): The direction of the flip.
-            theta (float): The threshold for the gap.
-            seed (int): The random seed.
-            time_limit_s (float): The time limit in seconds.
-            mip_gap (float): The MIP gap.
-            structure (TreeStructure | None, optional): The tree structure. Defaults to
-                                                        None.
-            v (NDArray[np.float64] | None, optional): The vector of values. Defaults to
-                                                      None.
+            booster (xgb.Booster): The model to search.
+            leaf_map (LeafMap): Global leaf map for `booster`.
+            columns (list[str]): All feature names, in model column order.
+            feature_bounds (dict[str, tuple[float, float]]): Raw `(lo, hi)`
+                bounds per feature.
+            spec (Spec): Dataset spec, for validity/plausibility encoding.
+            bins (FrozenBins): Frozen plausibility bins.
+            flip_set (tuple[str, ...]): Features x1/x2 are allowed to differ on.
+            direction (str): `"protected"` or `"monotone_wrong"`.
+            settings (Settings): Supplies `oracle.type` and everything the
+                selected oracle needs.
+            structure (TreeStructure | None): Pre-extracted tree structure;
+                extracted fresh if None.
+            v (NDArray[np.float64] | None): Leaf values to search with;
+                `leaf_map.v0` if None.
 
         Returns:
-            float: The worst valid gap for the repaired booster with respect to the
-                   flipped features.
+            float: The worst valid gap, or NaN on `EMPTY_DOMAIN`.
         """
 
-        oracle = TierAOracle()
-        pair: Pair | None = oracle.worst_valid_pair(
+        oracle_type: str = settings.oracle.type
+        oracle: SenseiOracle | EnsenseOracle = (
+            SenseiOracle() if oracle_type == "sensei" else EnsenseOracle()
+        )
+
+        if oracle_type == "sensei":
+            assert isinstance(oracle, SenseiOracle)
+            search: Callable[..., Pair | None] = oracle.worst_valid_pair
+        else:
+            assert isinstance(oracle, EnsenseOracle)
+            search = oracle.worst_valid_pair_loop
+
+        pair: Pair | None = search(
             booster,
             leaf_map,
             columns,
@@ -189,15 +195,11 @@ class Metrics:
             flip_set,
             direction,
             mode="optimality",
-            eps=0.0,
-            seed=seed,
-            time_limit_s=time_limit_s,
-            mip_gap=mip_gap,
+            settings=settings,
             enforce_validity=True,
             structure=structure,
             v=v,
             bins=bins,
-            theta=theta,
         )
 
         if pair is None:
@@ -213,32 +215,70 @@ class Metrics:
     @staticmethod
     def slack_mass(slack: NDArray[np.float64]) -> float:
         """
-        Compute the sum of the slack values at repair termination.
+        `sum(s_i)` at repair termination -- >0 is a finding, not a failure.
 
         Args:
-            slack (NDArray[np.float64]): The array of slack values at repair
-                                         termination.
+            slack (NDArray[np.float64]): Per-cut slack values.
 
         Returns:
-            float: The sum of the slack values.
+            float: The total slack mass.
         """
 
         return float(np.sum(slack))
 
     @staticmethod
-    def _flip_next_level(rows: pd.DataFrame, feature: str) -> pd.DataFrame:
+    def overlap_rate(
+        booster: xgb.Booster,
+        leaf_map: LeafMap,
+        fresh_pairs: list[Pair],
+        columns: list[str],
+        cuts: list[Cut],
+    ) -> float:
         """
-        Flip the values of a given feature in a DataFrame to the next level in its
-        sorted unique values. If the feature has only one unique value, the DataFrame
-        is returned unchanged.
+        Fraction of fresh_pairs whose exact leaf-difference pattern was already
+        cut. The per-pair matching logic (does this pair's `d` equal an
+        existing cut's, up to sign) lives in
+        `region_overlap.py::RegionOverlapAnalyzer.check_overlap` -- this is
+        just the aggregate over many pairs, same shape as `sensitivity_rate`.
+        High overlap alongside a low fresh-violation count is the evidence
+        that a cut fixes a whole region of input space, not one point (see
+        `eval/heldout_verify.py`).
 
         Args:
-            rows (pd.DataFrame): The DataFrame containing the rows to flip.
-            feature (str): The feature whose values are to be flipped.
+            booster (xgb.Booster): The model `fresh_pairs` were found against.
+            leaf_map (LeafMap): Global leaf map for `booster`.
+            fresh_pairs (list[Pair]): Freshly found counterexamples to check.
+            columns (list[str]): All feature names, in model column order.
+            cuts (list[Cut]): Already-accumulated cuts to check overlap against.
 
         Returns:
-            pd.DataFrame: The DataFrame with the specified feature flipped to the next
-                          level.
+            float: Fraction of `fresh_pairs` matching an existing cut, or
+                NaN if `fresh_pairs` is empty.
+        """
+
+        if not fresh_pairs:
+            return float("nan")
+
+        matches: int = sum(
+            RegionOverlapAnalyzer.check_overlap(
+                booster, leaf_map, p, columns, cuts
+            ).matched_existing_cut
+            for p in fresh_pairs
+        )
+        return matches / len(fresh_pairs)
+
+    @staticmethod
+    def _flip_next_level(rows: pd.DataFrame, feature: str) -> pd.DataFrame:
+        """
+        Roll `feature` to the next level in its sorted unique values
+        (unchanged if only one level exists).
+
+        Args:
+            rows (pd.DataFrame): Rows to flip `feature` on.
+            feature (str): The feature to roll to its next level.
+
+        Returns:
+            pd.DataFrame: `rows` with `feature` rolled, a copy.
         """
 
         levels: NDArray[np.str_] = np.sort(rows[feature].unique())

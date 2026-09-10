@@ -4,6 +4,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
+from numpy.typing import NDArray
 
 _ROOT: Path = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT))
@@ -60,6 +61,7 @@ def test_oracle_returning_none_means_insensitive() -> None:
 def test_a_valid_pair_is_returned_immediately() -> None:
     ds, spec, bins = _fixture()
 
+    assert ds.X_train is not None
     assert ds.columns is not None and ds.feature_bounds is not None
 
     row: pd.Series = ds.X_train.iloc[0]
